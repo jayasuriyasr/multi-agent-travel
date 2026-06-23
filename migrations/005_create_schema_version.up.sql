@@ -1,0 +1,6 @@
+CREATE TABLE schema_version (
+    id         INTEGER PRIMARY KEY DEFAULT 1,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+INSERT INTO schema_version DEFAULT VALUES;

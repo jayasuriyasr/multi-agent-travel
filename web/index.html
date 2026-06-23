@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Axentra | Seat-Aware Routing</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0f111a;
+            --panel-bg: rgba(22, 25, 37, 0.7);
+            --border-color: rgba(255, 255, 255, 0.1);
+            --primary: #4F46E5;
+            --primary-hover: #4338ca;
+            --accent: #10B981;
+            --text-main: #f8fafc;
+            --text-muted: #94a3b8;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+            font-family: 'Inter', sans-serif;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            background-image: radial-gradient(circle at top right, rgba(79, 70, 229, 0.15), transparent 40%),
+                              radial-gradient(circle at bottom left, rgba(16, 185, 129, 0.1), transparent 40%);
+            color: var(--text-main);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 3rem 1rem;
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 3rem;
+            animation: fadeInDown 0.8s ease-out;
+        }
+
+        .header h1 {
+            font-size: 3rem;
+            font-weight: 800;
+            letter-spacing: -1px;
+            background: linear-gradient(135deg, #fff, #a5b4fc);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 0.5rem;
+        }
+
+        .header p {
+            color: var(--text-muted);
+            font-size: 1.1rem;
+        }
+
+        .container {
+            width: 100%;
+            max-width: 1000px;
+            display: grid;
+            grid-template-columns: 350px 1fr;
+            gap: 2rem;
+        }
+
+        @media (max-width: 800px) {
+            .container {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        .panel {
+            background: var(--panel-bg);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--border-color);
+            border-radius: 16px;
+            padding: 2rem;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+        }
+
+        .search-panel {
+            animation: fadeInLeft 0.6s ease-out;
+        }
+
+        .results-panel {
+            animation: fadeInRight 0.6s ease-out;
+            min-height: 400px;
+        }
+
+        .form-group {
+            margin-bottom: 1.2rem;
+        }
+
+        label {
+            display: block;
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--text-muted);
+            margin-bottom: 0.4rem;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        input, select {
+            width: 100%;
+            background: rgba(0, 0, 0, 0.2);
+            border: 1px solid var(--border-color);
+            color: var(--text-main);
+            padding: 0.75rem 1rem;
+            border-radius: 8px;
+            font-size: 1rem;
+            transition: all 0.2s;
+            outline: none;
+        }
+
+        input:focus, select:focus {
+            border-color: var(--primary);
+            box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.2);
+        }
+
+        button {
+            width: 100%;
+            background: var(--primary);
+            color: white;
+            border: none;
+            padding: 1rem;
+            border-radius: 8px;
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            margin-top: 1rem;
+            box-shadow: 0 4px 14px 0 rgba(79, 70, 229, 0.39);
+        }
+
+        button:hover {
+            background: var(--primary-hover);
+            transform: translateY(-1px);
+        }
+
+        button:active {
+            transform: translateY(1px);
+        }
+
+        .path-card {
+            background: rgba(255, 255, 255, 0.03);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 1.5rem;
+            margin-bottom: 1rem;
+            transition: transform 0.2s, background 0.2s;
+            animation: slideUp 0.4s ease-out forwards;
+            opacity: 0;
+            transform: translateY(10px);
+        }
+
+        .path-card:hover {
+            background: rgba(255, 255, 255, 0.06);
+            transform: scale(1.01);
+        }
+
+        .path-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 1.2rem;
+            padding-bottom: 0.8rem;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+
+        .path-time {
+            font-size: 1.2rem;
+            font-weight: 700;
+            color: var(--accent);
+        }
+
+        .path-meta {
+            display: flex;
+            gap: 1rem;
+            font-size: 0.9rem;
+            color: var(--text-muted);
+        }
+
+        .badge {
+            background: rgba(255, 255, 255, 0.1);
+            padding: 0.2rem 0.6rem;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            font-weight: 600;
+        }
+
+        .leg {
+            display: flex;
+            align-items: flex-start;
+            position: relative;
+            padding-bottom: 1.5rem;
+        }
+
+        .leg:last-child {
+            padding-bottom: 0;
+        }
+
+        .leg::before {
+            content: '';
+            position: absolute;
+            left: 5px;
+            top: 15px;
+            bottom: -5px;
+            width: 2px;
+            background: var(--border-color);
+        }
+
+        .leg:last-child::before {
+            display: none;
+        }
+
+        .leg-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: var(--primary);
+            margin-right: 1rem;
+            margin-top: 5px;
+            position: relative;
+            z-index: 1;
+            box-shadow: 0 0 10px var(--primary);
+        }
+
+        .leg-content {
+            flex: 1;
+        }
+
+        .leg-route {
+            font-size: 0.85rem;
+            color: var(--primary);
+            font-weight: 600;
+            margin-bottom: 0.2rem;
+            letter-spacing: 0.5px;
+        }
+
+        .leg-stations {
+            display: flex;
+            justify-content: space-between;
+            font-weight: 500;
+            margin-bottom: 0.2rem;
+        }
+
+        .leg-times {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }
+
+        .status-msg {
+            text-align: center;
+            color: var(--text-muted);
+            padding: 2rem;
+            font-size: 1.1rem;
+        }
+
+        .query-stats {
+            text-align: right;
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            margin-bottom: 1rem;
+        }
+
+        /* Loading Spinner */
+        .loader {
+            border: 3px solid rgba(255,255,255,0.1);
+            border-top: 3px solid var(--primary);
+            border-radius: 50%;
+            width: 30px;
+            height: 30px;
+            animation: spin 1s linear infinite;
+            margin: 2rem auto;
+        }
+
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        @keyframes fadeInDown { from { opacity: 0; transform: translateY(-20px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes fadeInLeft { from { opacity: 0; transform: translateX(-30px); } to { opacity: 1; transform: translateX(0); } }
+        @keyframes fadeInRight { from { opacity: 0; transform: translateX(30px); } to { opacity: 1; transform: translateX(0); } }
+        @keyframes slideUp { to { opacity: 1; transform: translateY(0); } }
+
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <h1>Axentra Engine</h1>
+        <p>Real-time, seat-aware transit routing in under 5ms.</p>
+    </div>
+
+    <div class="container">
+        <!-- Search Form -->
+        <div class="panel search-panel">
+            <form id="searchForm">
+                <div class="form-group">
+                    <label>Origin Station</label>
+                    <input type="text" id="origin" value="STN_A" required>
+                </div>
+                <div class="form-group">
+                    <label>Destination Station</label>
+                    <input type="text" id="destination" value="STN_D" required>
+                </div>
+                <div class="form-group">
+                    <label>Travel Date</label>
+                    <input type="date" id="date" value="2026-06-25" required>
+                </div>
+                <div class="form-group">
+                    <label>Departure Time</label>
+                    <input type="time" id="time" value="08:00" required>
+                </div>
+                <div class="form-group">
+                    <label>Seat Class</label>
+                    <select id="seatClass">
+                        <option value="lower">Lower Class</option>
+                        <option value="upper">Upper Class</option>
+                        <option value="seater">Seater</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Passengers</label>
+                    <input type="number" id="passengers" value="1" min="1" max="10" required>
+                </div>
+                <button type="submit">Find Routes</button>
+            </form>
+        </div>
+
+        <!-- Results Display -->
+        <div class="panel results-panel">
+            <div id="resultsContainer">
+                <div class="status-msg">
+                    <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" style="color:var(--text-muted); opacity: 0.5; margin-bottom: 1rem;"><path d="M12 2v20M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+                    <p>Enter your search parameters to find optimal routes.</p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function formatTime(unixStr) {
+            const date = new Date(parseInt(unixStr) * 1000);
+            return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        }
+
+        function formatDuration(seconds) {
+            const h = Math.floor(seconds / 3600);
+            const m = Math.floor((seconds % 3600) / 60);
+            if (h > 0) return `${h}h ${m}m`;
+            return `${m}m`;
+        }
+
+        document.getElementById('searchForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const resultsDiv = document.getElementById('resultsContainer');
+            resultsDiv.innerHTML = '<div class="loader"></div><div class="status-msg">Running RAPTOR traversal...</div>';
+
+            // Construct Unix timestamp for dep_time
+            const dateVal = document.getElementById('date').value;
+            const timeVal = document.getElementById('time').value;
+            const datetime = new Date(`${dateVal}T${timeVal}:00`);
+            const depUnix = Math.floor(datetime.getTime() / 1000);
+
+            const params = new URLSearchParams({
+                origin: document.getElementById('origin').value.trim(),
+                destination: document.getElementById('destination').value.trim(),
+                date: dateVal,
+                dep_time: depUnix,
+                seat_class: document.getElementById('seatClass').value,
+                passengers: document.getElementById('passengers').value
+            });
+
+            try {
+                const response = await fetch(`/api/search?${params.toString()}`);
+                const data = await response.json();
+
+                if (!response.ok) {
+                    let msg = data.error || 'Server error occurred.';
+                    if (data.error === 'warming_up') {
+                        msg = 'System is currently warming up and initializing route buffers. Please try again in a moment.';
+                    }
+                    resultsDiv.innerHTML = `<div class="status-msg" style="color: #ef4444;">Error: ${msg}</div>`;
+                    return;
+                }
+
+                if (!data.paths || data.paths.length === 0) {
+                    resultsDiv.innerHTML = `<div class="status-msg">No viable routes found with sufficient seat availability.</div>`;
+                    return;
+                }
+
+                let html = `<div class="query-stats">Found ${data.result_count} paths in <b style="color:var(--accent)">${data.query_duration_ms.toFixed(3)} ms</b></div>`;
+
+                data.paths.forEach((path, i) => {
+                    const delay = i * 0.1; // Staggered animation
+                    
+                    let legsHtml = '';
+                    path.legs.forEach(leg => {
+                        legsHtml += `
+                            <div class="leg">
+                                <div class="leg-dot"></div>
+                                <div class="leg-content">
+                                    <div class="leg-route">${leg.route_id} <span style="color:var(--text-muted);font-weight:400;font-size:0.8rem">(${leg.trip_id})</span></div>
+                                    <div class="leg-stations">
+                                        <span>${leg.board_station}</span>
+                                        <span>${leg.alight_station}</span>
+                                    </div>
+                                    <div class="leg-times">
+                                        <span>${formatTime(leg.departure_unix)}</span>
+                                        <span>${formatTime(leg.arrival_unix)}</span>
+                                    </div>
+                                </div>
+                            </div>
+                        `;
+                    });
+
+                    html += `
+                        <div class="path-card" style="animation-delay: ${delay}s">
+                            <div class="path-header">
+                                <div class="path-time">${formatDuration(path.total_time_seconds)}</div>
+                                <div class="path-meta">
+                                    <span class="badge">${path.transfers} Transfer${path.transfers !== 1 ? 's' : ''}</span>
+                                    <span class="badge" style="background:rgba(16, 185, 129, 0.1);color:var(--accent)">Seats Verified</span>
+                                </div>
+                            </div>
+                            <div class="path-legs">
+                                ${legsHtml}
+                            </div>
+                        </div>
+                    `;
+                });
+
+                resultsDiv.innerHTML = html;
+
+            } catch (error) {
+                resultsDiv.innerHTML = `<div class="status-msg" style="color: #ef4444;">Connection failed. Is the server running?</div>`;
+            }
+        });
+    </script>
+</body>
+</html>

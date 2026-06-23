@@ -1,0 +1,79 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Axentra – Infrastructure Services
+# Bring up with: make db-up
+# Tear down with: make db-down
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── PostgreSQL 15 ──────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    container_name: axentra_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER:     axentra_user
+      POSTGRES_PASSWORD: axentra_pass
+      POSTGRES_DB:       axentra_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U axentra_user -d axentra_db"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # ── Redis 7 (AOF persistence, RDB snapshots disabled) ─────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: axentra_redis
+    restart: unless-stopped
+    # AOF enabled for durability of lock keys;
+    # RDB snapshots explicitly disabled (save "") so no periodic .rdb dumps.
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --save ""
+      --loglevel warning
+    ports:
+      - "6379:6379"
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # ── Axentra Application ────────────────────────────────────────────────────
+  axentra:
+    build: .
+    container_name: axentra_app
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      PG_DSN:              "postgres://axentra_user:axentra_pass@postgres:5432/axentra_db?sslmode=disable"
+      REDIS_ADDR:          "redis:6379"
+      REDIS_PASSWORD:      ""
+      REDIS_DB:            "0"
+      FIBER_PORT:          "8080"
+      ASYNQ_CONCURRENCY:   "20"
+      WATCHER_INTERVAL_SEC: "120"
+      LOG_LEVEL:           "info"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  redisdata:
