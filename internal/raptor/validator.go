@@ -27,7 +27,9 @@ func ValidateAndTruncate(ctx context.Context, rdb *redis.Client,
 	keySet := make(map[string]struct{})
 	for _, p := range candidates {
 		for _, leg := range p.Legs {
-			keySet[fmt.Sprintf("seat:map:%s:%s", leg.TripID, leg.Date)] = struct{}{}
+			if leg.RouteID != "WALK" {
+				keySet[fmt.Sprintf("seat:map:%s:%s", leg.TripID, leg.Date)] = struct{}{}
+			}
 		}
 	}
 
@@ -63,8 +65,14 @@ func ValidateAndTruncate(ctx context.Context, rdb *redis.Client,
 	for _, p := range candidates {
 		allLegsOK := true
 		for _, leg := range p.Legs {
+			if leg.RouteID == "WALK" {
+				continue // No seat validation needed for walking between platforms
+			}
 			k := fmt.Sprintf("seat:map:%s:%s", leg.TripID, leg.Date)
 			seatMap := cache[k]
+			// seatMap == nil means Redis has no record for this leg (key absent or
+			// evicted). Treat that as "seats unconfirmed" and reject the path.
+			// Previously `seatMap != nil && ...` let nil-keyed legs pass silently.
 			if seatMap == nil || seatMap[class] < count {
 				allLegsOK = false
 				break

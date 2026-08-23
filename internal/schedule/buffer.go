@@ -29,6 +29,7 @@ type RouteBuffer struct {
 	StopTimes    [][]model.TripStopTimes // [routeIdx][tripIdx]
 	TripIndex    map[model.TripKey]model.TripLocation
 	StopToRoutes map[string][]RouteStop // stationID → [(routeIdx, stopPos)]
+	Footpaths    map[string][]model.Footpath // stationID → walkable neighbours (paper Section 3.1)
 }
 
 var (
@@ -41,10 +42,12 @@ func init() {
 	routeBuffers[0] = &RouteBuffer{
 		TripIndex:    make(map[model.TripKey]model.TripLocation),
 		StopToRoutes: make(map[string][]RouteStop),
+		Footpaths:    make(map[string][]model.Footpath),
 	}
 	routeBuffers[1] = &RouteBuffer{
 		TripIndex:    make(map[model.TripKey]model.TripLocation),
 		StopToRoutes: make(map[string][]RouteStop),
+		Footpaths:    make(map[string][]model.Footpath),
 	}
 }
 

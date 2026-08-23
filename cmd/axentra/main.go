@@ -55,25 +55,27 @@ func main() {
 	if err := schedule.ReloadRouteArrays(ctx, pool); err != nil {
 		log.Fatalf("[main] initial route load failed: %v", err)
 	}
-	buf := schedule.LiveRoutes()
+	buf := schedule.LiveRoutes()    			   					// loads the live buffer
 	log.Printf("[main] ✅ route arrays loaded — %d routes, %d trips in RAM",
 		len(buf.Routes), len(buf.TripIndex))
+
+	// ── Initialize Redis client (fast-fail on unreachable) ────────────────────
+	rdb := config.InitRedis(ctx, redisURL)
+	defer rdb.Close()
+
+	// ── Seed mode: populate DB and exit cleanly ────────────────────────────────
+	// MUST run BEFORE WatcherLoop is spawned — seeding truncates all tables,
+	// so having the watcher running during truncation causes race conditions.
+	if *seedFlag {
+		schedule.SeedDatabase(ctx, pool, rdb)
+		log.Println("[main] seeding complete — exiting")
+		os.Exit(0)
+	}
 
 	// ── Phase 1b: Background schema watcher ───────────────────────────────────
 	// Polls schema_version every 2 minutes and hot-swaps the buffer on change.
 	// Spawned AFTER the initial load so the watcher never races with boot.
 	go schedule.WatcherLoop(ctx, pool)
-
-	// ── Seed mode: populate DB and exit cleanly ────────────────────────────────
-	if *seedFlag {
-		schedule.SeedDatabase(ctx, pool)
-		log.Println("[main] seeding complete — exiting")
-		os.Exit(0)
-	}
-
-	// ── Initialize Redis client (fast-fail on unreachable) ────────────────────
-	rdb := config.InitRedis(ctx, redisURL)
-	defer rdb.Close()
 
 	// ── Phase 2: Seat signal cold-start ───────────────────────────────────────
 	// Reads the latest seat:map and seat:ts for every trip currently in the

@@ -6,18 +6,17 @@ import (
 	"log"
 	"time"
 
-	"axentra/internal/model"
-
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/redis/go-redis/v9"
 )
 
 // SeedDatabase truncates domain tables and inserts specific mock data
-// for stations, routes, trips, and stop times.
-func SeedDatabase(ctx context.Context, pool *pgxpool.Pool) {
+// for stations, routes, trips, and stop times, and seeds Redis with seat data.
+func SeedDatabase(ctx context.Context, pool *pgxpool.Pool, rdb *redis.Client) {
 	log.Println("[seeder] starting database seed...")
 
-	_, err := pool.Exec(ctx, `TRUNCATE TABLE stop_times, trips, routes, stations RESTART IDENTITY CASCADE`)
+	_, err := pool.Exec(ctx, `TRUNCATE TABLE stop_times, trips, routes, stations RESTART IDENTITY CASCADE`)	// identity means id stars from 0 not from rows which is existing cascade means delete every table whose takle connected with foriegn key
 	if err != nil {
 		log.Fatalf("[seeder] truncate failed: %v", err)
 	}
@@ -131,6 +130,26 @@ func SeedDatabase(ctx context.Context, pool *pgxpool.Pool) {
 				)
 				totalTrips++
 
+				// Seed Redis seat availability for this trip directly to bypass import cycle
+				tripDateStr := fmt.Sprintf("%s:%s", tripID, dateStr)
+				tsStr := fmt.Sprintf("%.6f", float64(time.Now().UnixNano())/1e9)
+				
+				pipe := rdb.Pipeline()
+				pipe.Set(ctx, fmt.Sprintf("seat:map:%s", tripDateStr), `{"lower":10,"upper":10,"seater":20}`, 0)
+				pipe.Set(ctx, fmt.Sprintf("seat:ts:%s", tripDateStr), tsStr, 0)
+				pipe.XAdd(ctx, &redis.XAddArgs{
+					Stream: "seat:dirty_stream",
+					MaxLen: 200000,
+					Approx: true,
+					Values: map[string]interface{}{
+						"trip":       tripDateStr,
+						"changed_at": tsStr,
+					},
+				})
+				if _, err := pipe.Exec(ctx); err != nil {
+					log.Printf("[seeder] warning: failed to seed seats in Redis for trip %s: %v", tripID, err)
+				}
+
 				for seq, stationID := range route.stopIDs {
 					depUnix := baseUnix + int64(seq)*int64(stopIntervalSec)
 					stopBatch.Queue(
@@ -182,5 +201,3 @@ func sendBatch(ctx context.Context, pool *pgxpool.Pool, batch *pgx.Batch) error 
 	}
 	return nil
 }
-
-var _ model.StopTime

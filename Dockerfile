@@ -19,10 +19,13 @@ FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata
 
 COPY --from=builder /axentra /usr/local/bin/axentra
+COPY --from=builder /app/web /web
 
 # Non-root user
 RUN adduser -D -u 1000 axentra
 USER axentra
+
+WORKDIR /
 
 EXPOSE 8080
 

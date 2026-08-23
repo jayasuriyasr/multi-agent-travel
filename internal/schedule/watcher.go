@@ -3,6 +3,7 @@ package schedule
 import (
 	"context"
 	"log"
+	"sort"
 	"sync/atomic"
 	"time"
 
@@ -33,7 +34,7 @@ func WatcherLoop(ctx context.Context, pool *pgxpool.Pool) {
 		case <-ctx.Done():
 			log.Println("[schedule] watcher: context cancelled, stopping")
 			return
-		case <-ticker.C:
+		case <-ticker.C:				// if it signals only following code will execute
 		}
 
 		var ts time.Time
@@ -65,6 +66,7 @@ func WatcherLoop(ctx context.Context, pool *pgxpool.Pool) {
 // QUERY ORDER: ORDER BY t.route_id ASC, t.trip_id ASC, t.date ASC, s.stop_seq ASC
 //   - t.date ASC is mandatory: without it, rows for the same trip_id on
 //     different dates arrive non-deterministically, corrupting the TripIndex.
+
 func ReloadRouteArrays(ctx context.Context, pool *pgxpool.Pool) error {
 	rows, err := pool.Query(ctx, `
 		SELECT t.route_id, t.trip_id, t.date::text, s.stop_seq, s.station_id, s.departure_unix
@@ -79,10 +81,11 @@ func ReloadRouteArrays(ctx context.Context, pool *pgxpool.Pool) error {
 
 	// ── Allocate a fresh staging buffer ──────────────────────────────────────
 	// stagingIdx is the buffer NOT currently live — safe to write exclusively.
-	stagingIdx := int32(1) - atomic.LoadInt32(&routeLivePtr)
+	stagingIdx := int32(1) - atomic.LoadInt32(&routeLivePtr) // 0 mean 1 and vice versa 
 	staging := &RouteBuffer{
 		TripIndex:    make(map[model.TripKey]model.TripLocation),
 		StopToRoutes: make(map[string][]RouteStop),
+		Footpaths:    make(map[string][]model.Footpath), // paper Section 3.1 — populated by footpath loader (currently empty; no crash)
 	}
 
 	// ── Temporary in-memory grouping structures ───────────────────────────────
@@ -97,10 +100,10 @@ func ReloadRouteArrays(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 
 	// routeID → ordered list of trips (order preserved from SQL ORDER BY)
-	routeTrips := make(map[string][]*tripRecord)
+	routeTrips := make(map[string][]*tripRecord)  									// stores multiple tripsRecord address 
 	// routeOrder tracks insertion order so we can iterate deterministically
 	var routeOrder []string
-	routeSeen := make(map[string]bool)
+	routeSeen := make(map[string]bool) 												// stores in one value  
 	var currentTrip *tripRecord
 
 	// ── Stream rows into grouped in-memory records ────────────────────────────
@@ -109,7 +112,7 @@ func ReloadRouteArrays(ctx context.Context, pool *pgxpool.Pool) error {
 		var stopSeq int
 		var depUnix int64
 
-		if err := rows.Scan(&routeID, &tripID, &date, &stopSeq, &stationID, &depUnix); err != nil {
+		if err := rows.Scan(&routeID, &tripID, &date, &stopSeq, &stationID, &depUnix); err != nil {  // & must only address of variable should be given (deep copy)
 			return err
 		}
 
@@ -119,13 +122,13 @@ func ReloadRouteArrays(ctx context.Context, pool *pgxpool.Pool) error {
 		if currentTrip == nil || currentTrip.key != key {
 			currentTrip = &tripRecord{key: key, routeID: routeID}
 			routeTrips[routeID] = append(routeTrips[routeID], currentTrip)
-			if !routeSeen[routeID] {
+			if !routeSeen[routeID] {                                   
 				routeSeen[routeID] = true
 				routeOrder = append(routeOrder, routeID)
 			}
 		}
 
-		currentTrip.stops = append(currentTrip.stops, stopRecord{
+		currentTrip.stops = append(currentTrip.stops, stopRecord{       // automatically updates it as (*currentTrip).stops 
 			stationID:     stationID,
 			departureUnix: depUnix,
 		})
@@ -141,12 +144,12 @@ func ReloadRouteArrays(ctx context.Context, pool *pgxpool.Pool) error {
 			continue
 		}
 
-		routeIdx := len(staging.Routes)
+		routeIdx := len(staging.Routes)  // the route index for the routeID 
 
 		// Derive canonical stop IDs from the first trip's stop sequence.
 		// All trips on the same route share the same stop sequence.
 		firstTrip := trips[0]
-		stopIDs := make([]string, len(firstTrip.stops))
+		stopIDs := make([]string, len(firstTrip.stops))     // just getting the squence of the stop for the routeId
 		for i, s := range firstTrip.stops {
 			stopIDs[i] = s.stationID
 		}
@@ -163,7 +166,9 @@ func ReloadRouteArrays(ctx context.Context, pool *pgxpool.Pool) error {
 			TripKeys: tripKeys,
 		})
 
-		// Build TripStopTimes for every trip on this route
+		// Build TripStopTimes for every trip on this route.
+		// NOTE: Do NOT build TripIndex here — positions will be invalidated by
+		// the sort.Slice below. TripIndex is rebuilt after the sort (E3 fix).
 		routeStopTimes := make([]model.TripStopTimes, len(trips))
 		for ti, t := range trips {
 			departures := make([]int64, len(t.stops))
@@ -177,15 +182,32 @@ func ReloadRouteArrays(ctx context.Context, pool *pgxpool.Pool) error {
 				Departures: departures,
 				StationIDs: stationIDs,
 			}
+		}
+		// Sort trips within this route by the departure time at the first stop
+		// (ascending) so RAPTOR can scan them in chronological order.
+		// Without this, trips are in trip_id alphabetical order which is only
+		// correct by coincidence for synthetically-named IDs (T01, T02 ...).
+		sort.Slice(routeStopTimes, func(i, j int) bool {
+			if len(routeStopTimes[i].Departures) == 0 {
+				return true
+			}
+			if len(routeStopTimes[j].Departures) == 0 {
+				return false
+			}
+			return routeStopTimes[i].Departures[0] < routeStopTimes[j].Departures[0]
+		})
+		staging.StopTimes = append(staging.StopTimes, routeStopTimes)
 
-			// Index this trip: TripKey → (routeIdx, tripIdx) inside staging ONLY
-			staging.TripIndex[t.key] = model.TripLocation{
+		// E3 FIX: Rebuild TripIndex AFTER sort so TripIdx reflects the final
+		// post-sort position. Building it before the sort (as previously done)
+		// caused every TripIdx to point to the wrong trip after reordering.
+		for ti, tst := range routeStopTimes {
+			staging.TripIndex[tst.Key] = model.TripLocation{
 				RouteIdx: routeIdx,
 				TripIdx:  ti,
 			}
 		}
-		staging.StopTimes = append(staging.StopTimes, routeStopTimes)
-
+		
 		// Build reverse index: stationID → [(routeIdx, stopPos)]
 		for pos, sid := range stopIDs {
 			staging.StopToRoutes[sid] = append(staging.StopToRoutes[sid],

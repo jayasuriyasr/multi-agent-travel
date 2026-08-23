@@ -66,6 +66,13 @@ type Leg struct {
 	ArrivalUnix   int64  `json:"arrival_unix"`
 }
 
+// Footpath represents a walkable transfer between two nearby stations.
+// Used by the RAPTOR footpath relaxation step (paper Section 3.1).
+type Footpath struct {
+	NeighbourStop string `json:"neighbour_stop"`
+	WalkSeconds   int    `json:"walk_seconds"`
+}
+
 // Path represents a complete journey from origin to destination.
 type Path struct {
 	Legs        []Leg   `json:"legs"`

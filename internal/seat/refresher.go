@@ -184,7 +184,7 @@ func fetchSignalFromRedis(ctx context.Context, rdb *redis.Client, key model.Trip
 		ByClass:    byClass,
 		Total:      total,
 		Stale:      stale,
-		SnapshotTs: float64(time.Now().UnixNano()) / 1e9,
+		SnapshotTs: ts,
 	}, nil
 }
 

@@ -300,15 +300,15 @@
             <form id="searchForm">
                 <div class="form-group">
                     <label>Origin Station</label>
-                    <input type="text" id="origin" value="STN_A" required>
+                    <input type="text" id="origin" value="STA-001" required>
                 </div>
                 <div class="form-group">
                     <label>Destination Station</label>
-                    <input type="text" id="destination" value="STN_D" required>
+                    <input type="text" id="destination" value="STA-004" required>
                 </div>
                 <div class="form-group">
                     <label>Travel Date</label>
-                    <input type="date" id="date" value="2026-06-25" required>
+                    <input type="date" id="date" required>
                 </div>
                 <div class="form-group">
                     <label>Departure Time</label>
@@ -342,6 +342,13 @@
     </div>
 
     <script>
+        // Set default date to today in local time format (YYYY-MM-DD)
+        const today = new Date();
+        const yyyy = today.getFullYear();
+        const mm = String(today.getMonth() + 1).padStart(2, '0');
+        const dd = String(today.getDate()).padStart(2, '0');
+        document.getElementById('date').value = `${yyyy}-${mm}-${dd}`;
+
         function formatTime(unixStr) {
             const date = new Date(parseInt(unixStr) * 1000);
             return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
