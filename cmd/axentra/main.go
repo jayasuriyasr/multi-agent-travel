@@ -73,7 +73,8 @@ func main() {
 	}
 
 	// ── Phase 1b: Background schema watcher ───────────────────────────────────
-	// Polls schema_version every 2 minutes and hot-swaps the buffer on change.
+	// Polls schema_version every 30 seconds AND listens on Postgres NOTIFY
+	// "schema_changed" for near-instant hot-swap on ingestion (L11 fix).
 	// Spawned AFTER the initial load so the watcher never races with boot.
 	go schedule.WatcherLoop(ctx, pool)
 

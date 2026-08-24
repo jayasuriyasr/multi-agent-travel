@@ -33,7 +33,20 @@ func ValidateBatch(trips []IngestTrip) error {
 			return fmt.Errorf("trip %v has no stop times", key)
 		}
 
-		// Verify monotonically increasing departure times
+		for i, st := range t.StopTimes {
+			// L2 fix: validate that ArrivalUnix is set and non-negative.
+			// Guard is < 0 (not <= 0): Unix epoch (0) is technically valid,
+			// though no real train departs at 1970-01-01 00:00 UTC.
+			if st.ArrivalUnix < 0 {
+				return fmt.Errorf("trip %v stop %d: negative arrival_unix %d", key, i, st.ArrivalUnix)
+			}
+			if st.DepartureUnix < st.ArrivalUnix {
+				return fmt.Errorf("trip %v stop %d: departure_unix %d < arrival_unix %d (train cannot leave before arriving)",
+					key, i, st.DepartureUnix, st.ArrivalUnix)
+			}
+		}
+
+		// Verify monotonically increasing departure times across stops
 		for i := 1; i < len(t.StopTimes); i++ {
 			if t.StopTimes[i].DepartureUnix <= t.StopTimes[i-1].DepartureUnix {
 				return fmt.Errorf("non-monotone stops in trip %v at seq %d: %d <= %d",
@@ -72,7 +85,7 @@ func IngestBatch(ctx context.Context, pool *pgxpool.Pool, trips []IngestTrip) er
 			return fmt.Errorf("insert trip %s/%s: %w", t.TripID, t.Date, err)
 		}
 
-		// Delete existing stop times and re-insert (simpler than upserting each)
+		// Delete existing stop times and re-insert
 		_, err = tx.Exec(ctx,
 			`DELETE FROM stop_times WHERE trip_id = $1 AND date = $2`,
 			t.TripID, t.Date,
@@ -82,10 +95,12 @@ func IngestBatch(ctx context.Context, pool *pgxpool.Pool, trips []IngestTrip) er
 		}
 
 		for _, st := range t.StopTimes {
+			// L2 fix: insert both arrival_unix and departure_unix.
 			_, err := tx.Exec(ctx,
-				`INSERT INTO stop_times (trip_id, date, stop_seq, station_id, departure_unix)
-				 VALUES ($1, $2, $3, $4, $5)`,
-				st.TripID, st.Date, st.StopSeq, st.StationID, st.DepartureUnix,
+				`INSERT INTO stop_times
+				   (trip_id, date, stop_seq, station_id, arrival_unix, departure_unix)
+				   VALUES ($1, $2, $3, $4, $5, $6)`,
+				st.TripID, st.Date, st.StopSeq, st.StationID, st.ArrivalUnix, st.DepartureUnix,
 			)
 			if err != nil {
 				return fmt.Errorf("insert stop_time seq %d for %s/%s: %w",

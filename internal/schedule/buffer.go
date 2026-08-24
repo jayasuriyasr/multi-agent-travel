@@ -28,47 +28,43 @@ type RouteBuffer struct {
 	Routes       []model.RouteEntry
 	StopTimes    [][]model.TripStopTimes // [routeIdx][tripIdx]
 	TripIndex    map[model.TripKey]model.TripLocation
-	StopToRoutes map[string][]RouteStop // stationID → [(routeIdx, stopPos)]
-	Footpaths    map[string][]model.Footpath // stationID → walkable neighbours (paper Section 3.1)
+	StopToRoutes map[string][]RouteStop           // stationID → [(routeIdx, stopPos)]
+	Footpaths    map[string][]model.Footpath       // stationID → walkable neighbours (L6)
 }
 
-var (
-	routeBuffers [2]*RouteBuffer
-	routeLivePtr int32  // atomic: 0 or 1
-	lastManifest string // hash of last successfully loaded manifest
-)
+// L13 fix: use atomic.Pointer[RouteBuffer] for type-safe, race-free pointer swaps,
+// matching the pattern already used by state.SignalBuffer in state/signal.go.
+var liveRoutePtr atomic.Pointer[RouteBuffer]
+
+// lastManifest is the hash of the last successfully loaded manifest.
+// Used to skip no-op reloads when data hasn't changed.
+var lastManifest string
+
 
 func init() {
-	routeBuffers[0] = &RouteBuffer{
+	initial := &RouteBuffer{
 		TripIndex:    make(map[model.TripKey]model.TripLocation),
 		StopToRoutes: make(map[string][]RouteStop),
 		Footpaths:    make(map[string][]model.Footpath),
 	}
-	routeBuffers[1] = &RouteBuffer{
-		TripIndex:    make(map[model.TripKey]model.TripLocation),
-		StopToRoutes: make(map[string][]RouteStop),
-		Footpaths:    make(map[string][]model.Footpath),
-	}
+	liveRoutePtr.Store(initial)
 }
 
 // LiveRoutes returns the current read-only route buffer.
 // RAPTOR goroutines capture this ONCE at the start of a search (G11).
 func LiveRoutes() *RouteBuffer {
-	return routeBuffers[atomic.LoadInt32(&routeLivePtr)]
+	return liveRoutePtr.Load()
 }
 
-// swapRoutes atomically swaps in the staging buffer.
+// swapRoutes atomically installs a new staging buffer as the live buffer.
 func swapRoutes(staging *RouteBuffer) {
-	idx := 1 - atomic.LoadInt32(&routeLivePtr)
-	routeBuffers[idx] = staging
-	atomic.StoreInt32(&routeLivePtr, idx)
+	liveRoutePtr.Store(staging)
 }
 
 // manifestHash produces a deterministic hash of the buffer content
 // to detect no-op ingestions and skip unnecessary swaps.
 func manifestHash(buf *RouteBuffer) string {
 	h := sha256.New()
-	// Sort trip keys for deterministic hashing
 	keys := make([]string, 0, len(buf.TripIndex))
 	for k := range buf.TripIndex {
 		keys = append(keys, fmt.Sprintf("%s:%s", k.TripID, k.Date))

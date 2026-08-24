@@ -13,8 +13,7 @@ import (
 type SignalBuffer = map[model.TripKey]model.SeatSignal
 
 var (
-	signalBuffers [2]atomic.Pointer[SignalBuffer]
-	signalLivePtr int32 // atomic: 0 or 1
+	liveSignal atomic.Pointer[SignalBuffer]
 
 	// READY is the global readiness flag. 0 = warming up, 1 = ready.
 	// Set to 1 only after ColdStart completes successfully.
@@ -23,24 +22,20 @@ var (
 
 func init() {
 	a := make(SignalBuffer)
-	b := make(SignalBuffer)
-	signalBuffers[0].Store(&a)
-	signalBuffers[1].Store(&b)
+	liveSignal.Store(&a)
 }
 
 // LiveSignal returns a pointer to the current read-only signal buffer.
 // RAPTOR goroutines call this ONCE at the start of a search (G11).
 func LiveSignal() *SignalBuffer {
-	return signalBuffers[atomic.LoadInt32(&signalLivePtr)].Load()
+	return liveSignal.Load()
 }
 
 // SwapSignal atomically swaps in a new staging buffer as the live buffer.
 // The caller must have built 'staging' as a completely new map — never
 // mutate the map that LiveSignal() currently returns (G7, G9).
 func SwapSignal(staging SignalBuffer) {
-	idx := 1 - atomic.LoadInt32(&signalLivePtr)
-	signalBuffers[idx].Store(&staging)
-	atomic.StoreInt32(&signalLivePtr, idx)
+	liveSignal.Store(&staging)
 }
 
 // MarkReady sets the global readiness flag to true.

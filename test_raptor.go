@@ -39,6 +39,6 @@ func main() {
 	candidates := raptor.RaptorSearch(params, 100)
 	fmt.Printf("RaptorSearch found %d paths\n", len(candidates))
 
-	final := raptor.ValidateAndTruncate(ctx, rdb, candidates, params.SeatClass, params.Passengers, 5)
+	final := raptor.ValidateAndTruncate(ctx, rdb, candidates, params.SeatClass, params.Passengers, 5, false)
 	fmt.Printf("ValidateAndTruncate returned %d paths\n", len(final))
 }
