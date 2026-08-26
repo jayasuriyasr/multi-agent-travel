@@ -1,50 +1,111 @@
-// Package state owns the SEAT_SIGNAL double-buffered atomic pointers and the
-// global READY flag. Deliberately kept tiny to minimize the blast radius of
-// Go's most dangerous gotcha: concurrent map read+write = fatal panic (G7).
+// Package state owns the double-buffered seat signal pointer and the global
+// readiness flag. It is deliberately tiny: this is the blast radius of Go's
+// most dangerous concurrency gotcha — a concurrent map read and write is a
+// fatal runtime panic that recover() cannot catch.
 package state
 
 import (
 	"sync/atomic"
+	"time"
 
 	"axentra/internal/model"
 )
 
 // SignalBuffer is the in-memory seat availability map keyed by TripKey.
+// A published buffer is immutable: writers build a new map and swap it in.
 type SignalBuffer = map[model.TripKey]model.SeatSignal
 
 var (
 	liveSignal atomic.Pointer[SignalBuffer]
 
-	// READY is the global readiness flag. 0 = warming up, 1 = ready.
-	// Set to 1 only after ColdStart completes successfully.
-	ready int32
+	// ready is the global readiness flag: false = warming up, true = serving.
+	ready atomic.Bool
+	// seatDataPresent records whether the seat buffer has ever been populated.
+	// Readiness and seat coverage are separate facts: the service can serve
+	// searches with an empty seat buffer, it just cannot validate them.
+	seatDataPresent atomic.Bool
+
+	// Counters kept alongside the buffer so health checks are O(1) and so
+	// staleness is a reported fact rather than something an operator has to
+	// infer from an empty result set.
+	signalCount  atomic.Int64
+	staleCount   atomic.Int64
+	lastSwapUnix atomic.Int64
 )
 
 func init() {
-	a := make(SignalBuffer)
-	liveSignal.Store(&a)
+	empty := make(SignalBuffer)
+	liveSignal.Store(&empty)
 }
 
 // LiveSignal returns a pointer to the current read-only signal buffer.
-// RAPTOR goroutines call this ONCE at the start of a search (G11).
-func LiveSignal() *SignalBuffer {
-	return liveSignal.Load()
-}
+// A search calls this ONCE at the start and uses that snapshot throughout.
+func LiveSignal() *SignalBuffer { return liveSignal.Load() }
 
-// SwapSignal atomically swaps in a new staging buffer as the live buffer.
-// The caller must have built 'staging' as a completely new map — never
-// mutate the map that LiveSignal() currently returns (G7, G9).
+// SwapSignal atomically publishes a new buffer.
+//
+// The caller must have built staging as a completely new map. Never mutate the
+// map that LiveSignal() currently returns — searches are reading it right now,
+// without a lock, and a concurrent write is an unrecoverable crash.
 func SwapSignal(staging SignalBuffer) {
+	stale := int64(0)
+	for _, sig := range staging {
+		if sig.Stale {
+			stale++
+		}
+	}
+
 	liveSignal.Store(&staging)
+	signalCount.Store(int64(len(staging)))
+	staleCount.Store(stale)
+	lastSwapUnix.Store(time.Now().Unix())
+	if len(staging) > 0 {
+		seatDataPresent.Store(true)
+	}
 }
 
-// MarkReady sets the global readiness flag to true.
-// Called exactly once after ColdStart succeeds (G8).
-func MarkReady() {
-	atomic.StoreInt32(&ready, 1)
+// SignalCount returns the number of trips currently carrying a seat signal.
+func SignalCount() int { return int(signalCount.Load()) }
+
+// StaleSignalCount returns how many of those signals are older than their
+// trip's polling cadence allows.
+func StaleSignalCount() int { return int(staleCount.Load()) }
+
+// SeatDataAge returns how long ago the seat buffer was last published, or zero
+// if it never has been.
+func SeatDataAge() time.Duration {
+	last := lastSwapUnix.Load()
+	if last == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(last, 0))
 }
 
-// IsReady returns true if the system has completed cold-start initialization.
-func IsReady() bool {
-	return atomic.LoadInt32(&ready) == 1
+// StaleFraction returns the share of signals that are stale, in [0,1].
+//
+// A high value means the optimistic in-memory pre-filter has effectively
+// stopped filtering and every result is riding on the strict validator — worth
+// surfacing before it turns into an incident.
+func StaleFraction() float64 {
+	total := signalCount.Load()
+	if total == 0 {
+		return 0
+	}
+	return float64(staleCount.Load()) / float64(total)
 }
+
+// MarkReady opens the service to traffic.
+func MarkReady() { ready.Store(true) }
+
+// MarkNotReady closes the service to traffic, used during shutdown so
+// load balancers drain this instance before the listener goes away.
+func MarkNotReady() { ready.Store(false) }
+
+// IsReady reports whether the service should accept API traffic.
+func IsReady() bool { return ready.Load() }
+
+// HasSeatData reports whether any seat signal has ever been loaded. When this
+// is false every search result will be rejected by the pessimistic validator,
+// so it is surfaced on the readiness endpoint rather than left to be guessed
+// from an empty result set.
+func HasSeatData() bool { return seatDataPresent.Load() }

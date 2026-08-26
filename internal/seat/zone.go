@@ -4,7 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
+	"math"
 	"time"
 
 	"axentra/internal/schedule"
@@ -12,26 +13,32 @@ import (
 	"github.com/hibiken/asynq"
 )
 
-// Zone defines a polling urgency tier based on time-to-departure.
+// TaskSeatPoll is the asynq task type for a single trip's seat poll.
+const TaskSeatPoll = "seat:poll"
+
+// Zone defines a polling urgency tier based on time to departure.
 type Zone struct {
 	Name     string
 	MaxHours float64
 	Interval time.Duration
 }
 
-// Zones ordered by urgency — first match wins in ClassifyZone.
-// RED  : departure < 12 h  → poll every 5 min
-// YELLOW: departure < 48 h  → poll every 30 min
-// GREEN : departure < 168 h → poll every 4 h
-// COLD  : default (no near departure) → poll every 24 h
+// Zones ordered by urgency — the first match wins in ClassifyZone.
+//
+//	RED    : departs in < 12 h  → poll every 5 min
+//	YELLOW : departs in < 48 h  → poll every 30 min
+//	GREEN  : departs in < 168 h → poll every 4 h
+//	COLD   : everything else    → poll every 24 h
 var Zones = []Zone{
 	{"RED", 12, 5 * time.Minute},
 	{"YELLOW", 48, 30 * time.Minute},
 	{"GREEN", 168, 4 * time.Hour},
-	{"COLD", 1 << 31, 24 * time.Hour},
+	{"COLD", math.MaxFloat64, 24 * time.Hour},
 }
 
-// ClassifyZone returns the polling zone for a trip based on hours until departure.
+// ClassifyZone returns the polling zone for a trip departing at departureUnix.
+// Trips already departed fall in RED: their seat state matters most right up
+// to the moment they leave.
 func ClassifyZone(departureUnix int64) Zone {
 	hours := float64(departureUnix-time.Now().Unix()) / 3600
 	for _, z := range Zones {
@@ -42,75 +49,83 @@ func ClassifyZone(departureUnix int64) Zone {
 	return Zones[len(Zones)-1]
 }
 
-// ZoneClassifyLoop is a background goroutine that ticks every 5 minutes.
-// It reads all known trips from the in-memory RAM buffer (NOT the DB),
-// classifies each trip into a polling zone, and enqueues a "seat:poll" task
-// with a ProcessIn delay equal to the zone interval.
+// DefaultClassifyInterval is how often the classifier re-scans the schedule.
+const DefaultClassifyInterval = 5 * time.Minute
+
+// ZoneClassifyLoop enqueues a seat poll for every known trip, at a cadence set
+// by the trip's urgency zone.
 //
-// The TaskID option prevents duplicate tasks: Asynq will reject an enqueue
-// if a task with the same ID already exists in the queue (idempotent enqueue).
-func ZoneClassifyLoop(ctx context.Context, client *asynq.Client) {
-	ticker := time.NewTicker(5 * time.Minute)
+// It reads the in-memory route buffer only — zero database I/O on this path.
+// The asynq TaskID makes the enqueue idempotent: re-enqueueing a task that is
+// still pending is rejected rather than duplicated.
+//
+// The first sweep runs immediately. Waiting a full tick before the first scan
+// left the whole fleet unpolled for minutes after every boot, which is exactly
+// when seat data is least likely to already exist.
+func ZoneClassifyLoop(ctx context.Context, client *asynq.Client, interval time.Duration) {
+	if interval <= 0 {
+		interval = DefaultClassifyInterval
+	}
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
-	log.Println("[seat] zone classifier: started")
+	slog.Info("zone classifier started", "interval", interval)
 
 	for {
+		classifyOnce(ctx, client)
+
 		select {
 		case <-ctx.Done():
-			log.Println("[seat] zone classifier: context cancelled, stopping")
+			slog.Info("zone classifier stopping")
 			return
 		case <-ticker.C:
 		}
-
-		buf := schedule.LiveRoutes()
-		enqueued := 0
-
-		for key, loc := range buf.TripIndex {
-			// Retrieve departure from RAM — no DB call here (G5 / spec requirement)
-			depUnix := int64(0)
-			if loc.RouteIdx < len(buf.StopTimes) && loc.TripIdx < len(buf.StopTimes[loc.RouteIdx]) {
-				deps := buf.StopTimes[loc.RouteIdx][loc.TripIdx].Departures
-				if len(deps) > 0 {
-					depUnix = deps[0]
-				}
-			}
-			if depUnix == 0 {
-				continue // no departure time available, skip
-			}
-
-			zone := ClassifyZone(depUnix)
-
-			payload, err := json.Marshal(map[string]string{
-				"trip_id": key.TripID,
-				"date":    key.Date,
-			})
-			if err != nil {
-				log.Printf("[seat] zone classifier: marshal error for %s/%s: %v", key.TripID, key.Date, err)
-				continue
-			}
-
-			task := asynq.NewTask("seat:poll", payload)
-			_, err = client.Enqueue(task,
-				asynq.ProcessIn(zone.Interval),
-				// Unique deduplication key — Asynq rejects re-enqueue if task already exists
-				asynq.TaskID(fmt.Sprintf("poll:%s:%s", key.TripID, key.Date)),
-				// Retain result for one full zone interval to aid observability
-				asynq.Retention(zone.Interval),
-			)
-			if err != nil {
-				// ErrTaskIDConflict is expected and safe — task is already scheduled
-				continue
-			}
-			enqueued++
-		}
-
-		log.Printf("[seat] zone classifier: scanned %d trips, enqueued %d new tasks",
-			len(buf.TripIndex), enqueued)
 	}
 }
 
-// getTripDeparture looks up a trip's departure from the in-memory route buffer.
-func getTripDeparture(tripID, date string) int64 {
-	return schedule.GetTripDeparture(tripID, date)
+// classifyOnce performs a single classification sweep over the route buffer.
+func classifyOnce(ctx context.Context, client *asynq.Client) {
+	buf := schedule.LiveRoutes()
+	enqueued, skipped := 0, 0
+
+	byZone := map[string]int{}
+
+	for key := range buf.TripIndex {
+		if ctx.Err() != nil {
+			return
+		}
+		depUnix := buf.TripDeparture(key)
+		if depUnix == 0 {
+			skipped++
+			continue
+		}
+		zone := ClassifyZone(depUnix)
+		byZone[zone.Name]++
+
+		payload, err := json.Marshal(pollPayload{TripID: key.TripID, Date: key.Date})
+		if err != nil {
+			slog.Error("zone classifier could not marshal payload",
+				"trip", key.TripID, "date", key.Date, "error", err)
+			continue
+		}
+
+		_, err = client.EnqueueContext(ctx, asynq.NewTask(TaskSeatPoll, payload),
+			asynq.ProcessIn(zone.Interval),
+			// Idempotent: a pending task with this ID is not duplicated.
+			asynq.TaskID(fmt.Sprintf("poll:%s:%s", key.TripID, key.Date)),
+			asynq.Retention(zone.Interval),
+			asynq.MaxRetry(3),
+		)
+		if err != nil {
+			// A TaskID conflict means the poll is already scheduled — expected
+			// and harmless, so it is not logged at error level.
+			continue
+		}
+		enqueued++
+	}
+
+	slog.Info("zone classifier sweep complete",
+		"trips", len(buf.TripIndex), "enqueued", enqueued, "no_departure", skipped,
+		"red", byZone["RED"], "yellow", byZone["YELLOW"],
+		"green", byZone["GREEN"], "cold", byZone["COLD"])
 }

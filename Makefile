@@ -1,67 +1,76 @@
-.PHONY: build run seed dev test test-cover lint \
-        db-up db-down docker-up docker-down docker-logs \
-        migrate-up migrate-down clean
+.PHONY: help build run seed migrate dev test test-race test-integration test-cover bench \
+        lint fmt tidy db-up db-down docker-up docker-down docker-logs clean
 
-# ── Default DSN (override via env: PG_DSN=... make migrate-up) ──────────────
 PG_DSN ?= postgres://axentra_user:axentra_pass@localhost:5432/axentra_db?sslmode=disable
+REDIS_ADDR ?= localhost:6379
 
-# ── Build & Run ─────────────────────────────────────────────────────────────
-build:
-	go build -o bin/axentra ./cmd/axentra
+help: ## Show this help
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+	 awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
 
-## Quick connectivity test — no binary produced.
-run:
-	go run cmd/axentra/main.go
+# ── Build and run ────────────────────────────────────────────────────────────
+build: ## Compile the binary into bin/
+	go build -trimpath -o bin/axentra ./cmd/axentra
 
-## Seed the database with mock schedule data (requires running Postgres).
-seed:
-	go run cmd/axentra/main.go -seed
+run: build ## Build, then run the service
+	./bin/axentra
 
-dev:
+dev: ## Run straight from source
 	go run ./cmd/axentra
 
-# ── Testing ──────────────────────────────────────────────────────────────────
-test:
-	go test -race -v ./...
+migrate: ## Apply pending migrations, then exit
+	go run ./cmd/axentra -migrate
 
-test-cover:
-	go test -race -coverprofile=coverage.out ./...
+seed: ## Load the demo timetable and seat data, then exit
+	go run ./cmd/axentra -seed
+
+# ── Tests ────────────────────────────────────────────────────────────────────
+test: ## Unit tests (no infrastructure needed)
+	go test ./...
+
+test-race: ## Unit tests under the race detector
+	go test -race ./...
+
+test-integration: ## All tests, including those that need Postgres and Redis
+	PG_TEST_DSN="$(PG_DSN)" REDIS_TEST_ADDR="$(REDIS_ADDR)" go test -race ./...
+
+test-cover: ## Coverage report at coverage.html
+	PG_TEST_DSN="$(PG_DSN)" REDIS_TEST_ADDR="$(REDIS_ADDR)" \
+	  go test -race -coverprofile=coverage.out ./...
 	go tool cover -html=coverage.out -o coverage.html
+	@echo "open coverage.html"
 
-# ── Linting ──────────────────────────────────────────────────────────────────
-lint:
-	golangci-lint run ./...
+bench: ## Search benchmarks
+	go test -run '^$$' -bench 'BenchmarkSearch' -benchmem ./internal/raptor/
 
-# ── Infrastructure (preferred short aliases) ─────────────────────────────────
-## Bring up PostgreSQL + Redis in detached mode.
-db-up:
+# ── Code quality ─────────────────────────────────────────────────────────────
+fmt: ## Format all Go source
+	gofmt -w .
+
+lint: ## Vet, plus golangci-lint when installed
+	go vet ./...
+	@command -v golangci-lint >/dev/null && golangci-lint run ./... || \
+	  echo "golangci-lint not installed; ran go vet only"
+
+tidy: ## Tidy and verify module dependencies
+	go mod tidy
+	go mod verify
+
+# ── Infrastructure ───────────────────────────────────────────────────────────
+db-up: ## Start Postgres and Redis only
 	docker compose up -d postgres redis
 
-## Stop and remove infra containers (data volumes are preserved).
-db-down:
+db-down: ## Stop the infrastructure containers (volumes preserved)
 	docker compose down
 
-# ── Full-stack Docker (includes the axentra app service) ─────────────────────
-docker-up:
+docker-up: ## Build and start the whole stack
 	docker compose up -d --build
 
-docker-down:
+docker-down: ## Stop everything and delete volumes
 	docker compose down -v
 
-docker-logs:
+docker-logs: ## Follow the application logs
 	docker compose logs -f axentra
 
-# ── Migrations (requires golang-migrate CLI) ─────────────────────────────────
-## Run all pending up-migrations.
-## Usage: make migrate-up
-##        PG_DSN="postgres://..." make migrate-up
-migrate-up:
-	migrate -path migrations -database "$(PG_DSN)" up
-
-## Roll back the last migration.
-migrate-down:
-	migrate -path migrations -database "$(PG_DSN)" down 1
-
-# ── Cleanup ───────────────────────────────────────────────────────────────────
-clean:
+clean: ## Remove build and coverage artefacts
 	rm -rf bin/ coverage.out coverage.html

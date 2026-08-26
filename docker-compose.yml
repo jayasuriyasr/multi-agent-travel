@@ -1,22 +1,20 @@
-version: "3.9"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Axentra – Infrastructure Services
-# Bring up with: make db-up
-# Tear down with: make db-down
-# ─────────────────────────────────────────────────────────────────────────────
+# Axentra — full local stack.
+#
+#   make docker-up     build and start everything
+#   make db-up         just Postgres and Redis, for `go run ./cmd/axentra`
+#
+# The `version` key is obsolete in Compose v2 and is deliberately omitted.
 
 services:
 
-  # ── PostgreSQL 15 ──────────────────────────────────────────────────────────
   postgres:
     image: postgres:15-alpine
     container_name: axentra_postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER:     axentra_user
+      POSTGRES_USER: axentra_user
       POSTGRES_PASSWORD: axentra_pass
-      POSTGRES_DB:       axentra_db
+      POSTGRES_DB: axentra_db
     ports:
       - "5432:5432"
     volumes:
@@ -28,13 +26,12 @@ services:
       retries: 10
       start_period: 10s
 
-  # ── Redis 7 (AOF persistence, RDB snapshots disabled) ─────────────────────
   redis:
     image: redis:7-alpine
     container_name: axentra_redis
     restart: unless-stopped
-    # AOF enabled for durability of lock keys;
-    # RDB snapshots explicitly disabled (save "") so no periodic .rdb dumps.
+    # AOF on for durability of the dirty stream and poll locks; RDB snapshots
+    # off, since a periodic dump buys nothing on top of AOF here.
     command: >
       redis-server
       --appendonly yes
@@ -52,7 +49,6 @@ services:
       retries: 10
       start_period: 5s
 
-  # ── Axentra Application ────────────────────────────────────────────────────
   axentra:
     build: .
     container_name: axentra_app
@@ -60,15 +56,28 @@ services:
     ports:
       - "8080:8080"
     environment:
-      PG_DSN:              "postgres://axentra_user:axentra_pass@postgres:5432/axentra_db?sslmode=disable"
-      REDIS_URL:           "redis://redis:6379/0"
-      REDIS_ADDR:          "redis:6379"
-      REDIS_PASSWORD:      ""
-      REDIS_DB:            "0"
-      FIBER_PORT:          "8080"
-      ASYNQ_CONCURRENCY:   "20"
-      WATCHER_INTERVAL_SEC: "120"
-      LOG_LEVEL:           "info"
+      # Every variable below is read by internal/config and takes effect.
+      PG_DSN: "postgres://axentra_user:axentra_pass@postgres:5432/axentra_db?sslmode=disable"
+      REDIS_URL: "redis://redis:6379/0"
+      AUTO_MIGRATE: "true"
+      FIBER_PORT: "8080"
+      ASYNQ_CONCURRENCY: "20"
+      WATCHER_INTERVAL_SEC: "30"
+      CLASSIFY_INTERVAL_SEC: "300"
+      SEAT_PROVIDER: "mock"
+      MAX_ROUNDS: "4"
+      MIN_TRANSFER_SECONDS: "0"
+      STRICT_SEAT_MODE: "false"
+      REDIS_MGET_CHUNK: "512"
+      STREAM_BATCH_SIZE: "500"
+      MIN_RESYNC_INTERVAL_SEC: "30"
+      SEAT_BREAKER_THRESHOLD: "5"
+      SEAT_BREAKER_COOLDOWN_SEC: "15"
+      MAX_WALK_SECONDS: "1800"
+      MAX_FOOTPATHS_PER_STATION: "64"
+      RATE_LIMIT_PER_MIN: "600"
+      LOG_LEVEL: "info"
+      LOG_FORMAT: "json"
     depends_on:
       postgres:
         condition: service_healthy

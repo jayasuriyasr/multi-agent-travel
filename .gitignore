@@ -1,0 +1,22 @@
+# Build output
+/bin/
+/axentra
+*.exe
+
+# Test and coverage artefacts
+*.out
+*.test
+coverage.out
+coverage.html
+
+# Local environment — never commit real credentials
+.env
+.env.local
+*.local.yml
+
+# Editor / OS noise
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

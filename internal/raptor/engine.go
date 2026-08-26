@@ -1,10 +1,26 @@
 // Package raptor implements the seat-aware RAPTOR search algorithm.
-// RAPTOR (Round-bAsed Public Transit Optimized Router) finds Pareto-optimal
-// paths that minimize both arrival time and number of transfers.
+//
+// RAPTOR (Round-bAsed Public Transit Optimized Router) computes the Pareto
+// frontier over two objectives — arrival time and number of transfers — by
+// running one "round" per vehicle leg. Round k holds the earliest arrival at
+// every station reachable using at most k vehicles, so the answer set is one
+// journey per useful transfer count.
+//
+// The single most important invariant in this file:
+//
+//	A trip may only be boarded in round k using the label from round k-1.
+//
+// Boarding off a label that the current round is still mutating collapses the
+// rounds into each other: journeys silently exceed the transfer limit, the
+// reported transfer count stops matching the legs, and — because the route
+// queue is a Go map — the answer starts depending on randomised map iteration
+// order. tau[k-1] is the previous round's frozen snapshot; it is the only
+// thing Step B is ever allowed to read.
 package raptor
 
 import (
-	"log"
+	"context"
+	"log/slog"
 	"math"
 	"sort"
 	"time"
@@ -13,17 +29,6 @@ import (
 	"axentra/internal/schedule"
 	"axentra/internal/state"
 )
-
-// maxRounds returns the effective round limit for the given params.
-// L4 fix: MaxRounds is no longer a hardcoded constant. Callers can set
-// SearchParams.MaxRounds for per-query control; the package default is used
-// when it is 0.
-func maxRounds(params model.SearchParams) int {
-	if params.MaxRounds > 0 {
-		return params.MaxRounds
-	}
-	return model.DefaultMaxRounds
-}
 
 const infinity = int64(math.MaxInt64)
 
@@ -42,7 +47,7 @@ const infinity = int64(math.MaxInt64)
 //	Layer 2 (ValidateAndTruncate in validator.go): PESSIMISTIC.
 //	  - Missing key in Redis → REJECT path.
 //	  - Insufficient seats in Redis → REJECT path.
-//	  - This runs after RAPTOR and does a fresh MGET before returning results.
+//	  - Runs after the search and does a fresh MGET before returning results.
 //
 // The asymmetry is intentional. Do not "fix" layer 1 to be strict without
 // understanding that layer 2 is the real enforcement point.
@@ -57,366 +62,489 @@ func canBoard(buf *state.SignalBuffer, key model.TripKey, class string, count in
 	return sig.ByClass[class] >= count
 }
 
-// journalEntry records a boarding/walking event for path reconstruction.
+// journalEntry records how a station was reached, so a path can be rebuilt by
+// walking backwards from the destination.
+//
+// fromRound is stored explicitly rather than inferred: a transit leg found in
+// round k departs from a label in round k-1, while a walk leg found in round k
+// departs from a label in round k. Guessing this is how backtracking loses
+// track of which round it is in and starts stitching together legs that do not
+// connect.
 type journalEntry struct {
-	round        int
-	station      string
-	tripKey      model.TripKey
-	routeID      string
-	boardStop    string
-	boardDepUnix int64
-	arrivalUnix  int64
+	kind      model.LegKind
+	fromRound int
+	from      string // station this leg departs from
+	tripKey   model.TripKey
+	routeID   string
+	departure int64
+	arrival   int64
+}
+
+// searchState is the per-query working set. It is created fresh for every
+// search and never shared, so nothing in here needs synchronisation.
+type searchState struct {
+	params  model.SearchParams
+	rounds  int
+	xferSec int64
+	dest    string
+
+	routes  *schedule.RouteBuffer
+	signals *state.SignalBuffer
+	allowed map[string]bool
+
+	// tau[k][stop] is the earliest arrival at stop using at most k vehicles.
+	tau []map[string]int64
+	// journal[k][stop] is the final leg of that journey.
+	journal []map[string]journalEntry
+	// best[stop] is the earliest arrival over all rounds (tau* in the paper),
+	// used for dominance checks and target pruning.
+	best map[string]int64
 }
 
 // RaptorSearch performs a seat-aware RAPTOR traversal and returns up to topK
-// Pareto-optimal paths from origin to destination.
+// Pareto-optimal journeys from origin to destination, best arrival first.
 //
-// Fixes applied:
-//   L1  — inner trip scan replaced with binary search (O(log T) per stop)
-//   L2  — uses Arrivals[pos] for alighting, Departures[pos] for boarding only
-//   L4  — MaxRounds read from SearchParams (runtime configurable)
-//   L5  — date filter applied inside trip scan loop
-//   L9  — path deduplication by leg fingerprint before return
-//   L14 — per-search latency logged
-func RaptorSearch(params model.SearchParams, topK int) []model.Path {
-	start := time.Now() // L14: latency tracking
+// The returned set is a true Pareto frontier: each journey arrives strictly
+// earlier than the one before it and uses strictly more transfers. Because
+// RAPTOR produces at most one journey per round, the frontier holds at most
+// params.Rounds()+1 entries no matter how large topK is.
+//
+// ctx is honoured between rounds; a cancelled context aborts the search and
+// returns nil.
+func RaptorSearch(ctx context.Context, params model.SearchParams, topK int) []model.Path {
+	start := time.Now()
 
-	// CAPTURE ONCE — the snapshot rule (G11)
-	buf := state.LiveSignal()
+	// CAPTURE ONCE — the snapshot rule. Both buffers are read exactly once so
+	// the entire search sees a single consistent view of the world even while
+	// background goroutines publish new ones.
+	signals := state.LiveSignal()
 	routes := schedule.LiveRoutes()
 
 	if routes == nil || len(routes.Routes) == 0 {
-		log.Printf("[raptor] search: no routes in buffer, returning nil")
+		slog.Warn("search aborted: no routes in buffer")
+		return nil
+	}
+	if params.Origin == "" || params.Destination == "" || params.Origin == params.Destination {
 		return nil
 	}
 
-	rounds := maxRounds(params) // L4 fix: configurable rounds
-
-	log.Printf("[raptor] search: origin=%s dest=%s date=%s depTime=%d rounds=%d routes=%d trips=%d signals=%d",
-		params.Origin, params.Destination, params.Date,
-		params.DepTime, rounds, len(routes.Routes), len(routes.TripIndex), len(*buf))
-
-	// tau[round][stationID] = earliest known arrival time at that station in that round
-	tau := make([]map[string]int64, rounds+1)
-	for r := 0; r <= rounds; r++ {
-		tau[r] = make(map[string]int64)
+	s := &searchState{
+		params:  params,
+		rounds:  params.Rounds(),
+		xferSec: params.TransferBuffer(),
+		dest:    params.Destination,
+		routes:  routes,
+		signals: signals,
+		allowed: computeAllowedDates(params.Date, params.DateWindow()),
+		best:    map[string]int64{params.Origin: params.DepTime},
 	}
+	s.tau = make([]map[string]int64, s.rounds+1)
+	s.journal = make([]map[string]journalEntry, s.rounds+1)
+	s.tau[0] = map[string]int64{params.Origin: params.DepTime}
+	s.journal[0] = map[string]journalEntry{}
 
-	// Best known arrival time across all rounds (τ* in the RAPTOR paper)
-	bestArrival := make(map[string]int64)
+	marked := map[string]struct{}{params.Origin: {}}
 
-	// Journal for path reconstruction (per round to maintain Pareto frontier)
-	journal := make([]map[string]journalEntry, rounds+1)
-	for r := 0; r <= rounds; r++ {
-		journal[r] = make(map[string]journalEntry)
-	}
+	// Round 0 footpaths: the passenger may walk away from the origin before
+	// boarding anything.
+	s.relaxFootpaths(0, []string{params.Origin}, marked)
 
-	// Initialize: origin departs at the requested time
-	tau[0][params.Origin] = params.DepTime
-	bestArrival[params.Origin] = params.DepTime
+	for k := 1; k <= s.rounds; k++ {
+		if ctx.Err() != nil {
+			slog.Warn("search cancelled", "round", k, "origin", params.Origin, "destination", params.Destination)
+			return nil
+		}
 
-	// Marked stops that were improved in the previous round
-	marked := map[string]bool{params.Origin: true}
+		// tau[k] starts as a copy of tau[k-1]: a journey using at most k-1
+		// vehicles also uses at most k. Copying the journal alongside keeps
+		// every label in tau[k] backed by a reconstructable chain.
+		s.tau[k] = make(map[string]int64, len(s.tau[k-1]))
+		s.journal[k] = make(map[string]journalEntry, len(s.journal[k-1]))
+		for stop, v := range s.tau[k-1] {
+			s.tau[k][stop] = v
+		}
+		for stop, e := range s.journal[k-1] {
+			s.journal[k][stop] = e
+		}
 
-	for round := 1; round <= rounds; round++ {
-		// Collect (route, earliest boarding position) for routes touching marked stops
-		queue := make(map[int]int) // routeIdx → earliest stop position
-
-		for station := range marked {
-			for _, rs := range routes.StopToRoutes[station] {
-				if existing, ok := queue[rs.RouteIdx]; !ok || rs.StopPos < existing {
+		// Collect (route → earliest boarding position) over stops improved last
+		// round, then walk the routes in sorted order. Sorting is not cosmetic:
+		// ranging over the map directly makes the result depend on Go's
+		// randomised iteration order.
+		queue := make(map[int]int)
+		for stop := range marked {
+			for _, rs := range routes.StopToRoutes[stop] {
+				if pos, seen := queue[rs.RouteIdx]; !seen || rs.StopPos < pos {
 					queue[rs.RouteIdx] = rs.StopPos
 				}
 			}
 		}
+		order := make([]int, 0, len(queue))
+		for ri := range queue {
+			order = append(order, ri)
+		}
+		sort.Ints(order)
 
-		newMarked := make(map[string]bool)
-
-		// ── Ride-forward scan ─────────────────────────────────────────────────
-		// L1 fix: At each stop, find the earliest eligible trip using binary
-		// search instead of a linear scan over all trips.
-		// L2 fix: Use tst.Arrivals[pos] (not tst.Departures[pos]) for alighting.
-		// L5 fix: Date filter applied inside findEarliestTrip.
-		for routeIdx, boardPos := range queue {
-			if routeIdx >= len(routes.StopTimes) {
-				continue
-			}
-			routeTrips := routes.StopTimes[routeIdx]
-			route := routes.Routes[routeIdx]
-
-			if len(routeTrips) == 0 || len(route.StopIDs) == 0 {
-				continue
-			}
-
-			var currentTrip *model.TripStopTimes
-			var boardStation string
-			var boardDep int64
-
-			for pos := boardPos; pos < len(route.StopIDs); pos++ {
-				station := route.StopIDs[pos]
-
-				// Step A: Propagate arrival from the trip we are currently riding.
-				// L2 fix: use Arrivals[pos] — the physical arrival time at this stop.
-				if currentTrip != nil && pos < len(currentTrip.Arrivals) {
-					arrivalAtStop := currentTrip.Arrivals[pos]
-					currentBest, hasBest := bestArrival[station]
-					if !hasBest || arrivalAtStop < currentBest {
-						bestArrival[station] = arrivalAtStop
-						tau[round][station] = arrivalAtStop
-						newMarked[station] = true
-						journal[round][station] = journalEntry{
-							round:        round,
-							station:      station,
-							tripKey:      currentTrip.Key,
-							routeID:      route.RouteID,
-							boardStop:    boardStation,
-							boardDepUnix: boardDep,
-							arrivalUnix:  arrivalAtStop,
-						}
-					}
-				}
-
-				// Step B: Can we board / switch to an earlier eligible trip here?
-				// L5 fix: findEarliestTrip applies the date filter.
-				arrivalHere, arrived := bestArrival[station]
-				if !arrived {
-					continue
-				}
-				currentDep := infinity
-				if currentTrip != nil && pos < len(currentTrip.Departures) {
-					currentDep = currentTrip.Departures[pos]
-				}
-
-				// L1 fix: binary search for the earliest catchable trip at this stop.
-				candidate := findEarliestTrip(routeTrips, pos, arrivalHere, currentDep, params, buf)
-				if candidate != nil {
-					currentTrip = candidate
-					boardStation = station
-					boardDep = currentTrip.Departures[pos]
-					// tighten currentDep so we only switch if an even earlier trip exists
-				}
-			}
+		improved := make(map[string]struct{})
+		for _, ri := range order {
+			s.scanRoute(k, ri, queue[ri], improved)
 		}
 
-		// ── Footpath relaxation ───────────────────────────────────────────────
-		// Snapshot transit-improved stops BEFORE the walk pass so walk-reached
-		// stops don't expand their own footpaths within the same round.
-		transitImproved := make([]string, 0, len(newMarked))
-		for s := range newMarked {
-			transitImproved = append(transitImproved, s)
+		// Footpath relaxation, from the stops transit improved this round.
+		// Snapshot the sources first so walk-reached stops do not expand their
+		// own footpaths — the walk graph is already transitively closed, so one
+		// pass finds every reachable neighbour.
+		sources := make([]string, 0, len(improved))
+		for stop := range improved {
+			sources = append(sources, stop)
 		}
-		for _, station := range transitImproved {
-			for _, fp := range routes.Footpaths[station] {
-				arrViaWalk := tau[round][station] + int64(fp.WalkSeconds)
-				cur, hasCur := bestArrival[fp.NeighbourStop]
-				if !hasCur || arrViaWalk < cur {
-					bestArrival[fp.NeighbourStop] = arrViaWalk
-					tau[round][fp.NeighbourStop] = arrViaWalk
-					newMarked[fp.NeighbourStop] = true
-					journal[round][fp.NeighbourStop] = journalEntry{
-						round:        round,
-						station:      fp.NeighbourStop,
-						routeID:      "WALK",
-						boardStop:    station,
-						boardDepUnix: tau[round][station],
-						arrivalUnix:  arrViaWalk,
-					}
-				}
-			}
-		}
+		sort.Strings(sources)
+		s.relaxFootpaths(k, sources, improved)
 
-		marked = newMarked
+		marked = improved
 		if len(marked) == 0 {
-			break // no improvements — early exit
+			break // nothing improved — no later round can improve either
 		}
 	}
 
-	// Check if destination was reached
-	if _, ok := bestArrival[params.Destination]; !ok {
-		log.Printf("[raptor] search: no path found (%s→%s) in %v", params.Origin, params.Destination, time.Since(start))
-		return nil
+	paths := s.extract(topK)
+
+	if slog.Default().Enabled(ctx, slog.LevelDebug) {
+		slog.Debug("search complete",
+			"origin", params.Origin, "destination", params.Destination,
+			"date", params.Date, "rounds", s.rounds,
+			"paths", len(paths), "duration", time.Since(start))
 	}
-
-	// Reconstruct paths from journal
-	paths := reconstructPaths(journal, params, rounds)
-
-	// Sort: fastest arrival first, then fewest transfers
-	sort.Slice(paths, func(i, j int) bool {
-		if paths[i].ArrivalUnix != paths[j].ArrivalUnix {
-			return paths[i].ArrivalUnix < paths[j].ArrivalUnix
-		}
-		return paths[i].Transfers < paths[j].Transfers
-	})
-
-	// L9 fix: deduplicate paths by leg fingerprint (same physical journey can
-	// appear in multiple rounds as RAPTOR discovers it at different transfer counts).
-	paths = deduplicatePaths(paths)
-
-	if len(paths) > topK {
-		paths = paths[:topK]
-	}
-
-	// L14: log per-search latency
-	log.Printf("[raptor] search: found %d paths (%s→%s date=%s) in %v",
-		len(paths), params.Origin, params.Destination, params.Date, time.Since(start))
-
 	return paths
 }
 
-// findEarliestTrip uses binary search to find the earliest trip on a route
-// that can be caught at stop position `pos` (L1 fix).
-//
-// Preconditions:
-//   - routeTrips is sorted by Departures[0] ascending (enforced by ReloadRouteArrays)
-//   - The NON-OVERTAKING property must hold: if trip A departs before trip B at
-//     stop 0, it also departs before trip B at every later stop. This is enforced
-//     for real-world data by L3 (same stop count) but not validated explicitly.
-//     Express trains that genuinely overtake locals on the same route will cause
-//     incorrect binary-search results. Guard against this in future data loading.
-//
-// L5 fix: only trips whose TripKey.Date matches params.Date OR params.Date+1
-// (for overnight journeys that cross midnight) are considered.
-func findEarliestTrip(
-	routeTrips []model.TripStopTimes,
-	pos int,
-	arrivalHere, currentDep int64,
-	params model.SearchParams,
-	buf *state.SignalBuffer,
-) *model.TripStopTimes {
-
-	// Pre-compute the allowed dates: search date and the following day
-	// (for overnight trains that cross midnight).
-	nextDate := overnightDate(params.Date)
-
-	// Binary search: find the first trip whose departure at `pos` >= arrivalHere.
-	// Relies on the non-overtaking property (see preconditions above).
-	lo := sort.Search(len(routeTrips), func(i int) bool {
-		if pos >= len(routeTrips[i].Departures) {
-			return false
-		}
-		return routeTrips[i].Departures[pos] >= arrivalHere
-	})
-
-	// Scan forward from `lo` to find the earliest trip that passes date,
-	// improvement threshold, and seat check.
-	// NOTE: break on dep >= bestDep is valid ONLY under the non-overtaking
-	// assumption. If that property fails, remove the break and use a full scan.
-	var best *model.TripStopTimes
-	bestDep := currentDep
-
-	for i := lo; i < len(routeTrips); i++ {
-		tst := &routeTrips[i]
-		if pos >= len(tst.Departures) {
-			continue
-		}
-		dep := tst.Departures[pos]
-		if dep >= bestDep {
-			// Non-overtaking: no later trip in the sorted list can depart earlier.
-			break
-		}
-		// L5 fix: accept search date OR next calendar day (overnight crossings).
-		if tst.Key.Date != params.Date && tst.Key.Date != nextDate {
-			continue
-		}
-		if !canBoard(buf, tst.Key, params.SeatClass, params.Passengers) {
-			continue
-		}
-		best = tst
-		bestDep = dep
+// scanRoute performs one route traversal for round k: ride forward from
+// boardPos, alighting wherever the current trip improves a station, and
+// boarding an earlier trip wherever round k-1 got the passenger there in time.
+func (s *searchState) scanRoute(k, routeIdx, boardPos int, improved map[string]struct{}) {
+	if routeIdx >= len(s.routes.StopTimes) || routeIdx >= len(s.routes.Routes) {
+		return
 	}
-	return best
+	route := s.routes.Routes[routeIdx]
+	trips := s.routes.StopTimes[routeIdx]
+	if len(trips) == 0 || len(route.StopIDs) == 0 {
+		return
+	}
+	fifo := s.routes.IsFIFO(routeIdx)
+
+	prevTau := s.tau[k-1]
+	prevJournal := s.journal[k-1]
+	curTau := s.tau[k]
+	curJournal := s.journal[k]
+
+	tripIdx := -1
+	boardStation := ""
+	boardDep := int64(0)
+
+	for pos := boardPos; pos < len(route.StopIDs); pos++ {
+		station := route.StopIDs[pos]
+
+		// ── Step A: alight ────────────────────────────────────────────────
+		// Propagate the arrival of the trip currently being ridden. Arrivals,
+		// not departures: the passenger gets off when the vehicle pulls in.
+		if tripIdx >= 0 && pos < len(trips[tripIdx].Arrivals) {
+			t := &trips[tripIdx]
+			arr := t.Arrivals[pos]
+			if s.improves(arr, station) {
+				curTau[station] = arr
+				s.best[station] = arr
+				curJournal[station] = journalEntry{
+					kind:      model.LegTransit,
+					fromRound: k - 1,
+					from:      boardStation,
+					tripKey:   t.Key,
+					routeID:   route.RouteID,
+					departure: boardDep,
+					arrival:   arr,
+				}
+				improved[station] = struct{}{}
+			}
+		}
+
+		// ── Step B: board ─────────────────────────────────────────────────
+		// Read ONLY the previous round's label. This is what makes round k
+		// mean "at most k vehicles".
+		ready, reachable := prevTau[station]
+		if !reachable {
+			continue
+		}
+		// Changing vehicles takes time; arriving on foot or starting here does not.
+		if e, had := prevJournal[station]; had && e.kind == model.LegTransit {
+			ready += s.xferSec
+		}
+
+		curDep := infinity
+		if tripIdx >= 0 && pos < len(trips[tripIdx].Departures) {
+			curDep = trips[tripIdx].Departures[pos]
+		}
+		if ready > curDep {
+			continue // cannot beat the trip already being ridden
+		}
+
+		if cand := s.earliestTrip(trips, pos, ready, curDep, fifo); cand >= 0 {
+			tripIdx = cand
+			boardStation = station
+			boardDep = trips[cand].Departures[pos]
+		}
+	}
 }
 
-// reconstructPaths backtracks from the destination through the journal
-// to build complete path objects.
-func reconstructPaths(journal []map[string]journalEntry, params model.SearchParams, rounds int) []model.Path {
-	var paths []model.Path
+// earliestTrip returns the index of the earliest trip departing stop position
+// pos at or after ready, strictly before mustBeat, that passes the date and
+// seat filters. It returns -1 when no such trip exists.
+//
+// Two strategies, chosen by a property measured at load time rather than
+// assumed:
+//
+//   - FIFO routes (no trip overtakes another at any stop) allow a binary
+//     search followed by a short forward scan.
+//   - Non-FIFO routes — an express passing a local on shared track — get a full
+//     linear scan. Binary search is simply wrong there, and silently returns a
+//     suboptimal trip rather than failing loudly.
+func (s *searchState) earliestTrip(trips []model.TripStopTimes, pos int, ready, mustBeat int64, fifo bool) int {
+	if fifo {
+		// Safe because RouteFIFO is only true when every trip on the route has
+		// the same stop count, which makes this predicate monotone.
+		lo := sort.Search(len(trips), func(i int) bool {
+			d := trips[i].Departures
+			if pos >= len(d) {
+				return true
+			}
+			return d[pos] >= ready
+		})
+		for i := lo; i < len(trips); i++ {
+			d := trips[i].Departures
+			if pos >= len(d) {
+				continue
+			}
+			if d[pos] >= mustBeat {
+				break // FIFO: no later trip departs earlier
+			}
+			if s.tripUsable(&trips[i]) {
+				return i
+			}
+		}
+		return -1
+	}
 
-	for r := 1; r <= rounds; r++ {
-		entry, ok := journal[r][params.Destination]
+	bestIdx, bestDep := -1, mustBeat
+	for i := range trips {
+		d := trips[i].Departures
+		if pos >= len(d) || d[pos] < ready || d[pos] >= bestDep {
+			continue
+		}
+		if s.tripUsable(&trips[i]) {
+			bestIdx, bestDep = i, d[pos]
+		}
+	}
+	return bestIdx
+}
+
+// tripUsable applies the calendar-date window and the optimistic seat pre-filter.
+func (s *searchState) tripUsable(t *model.TripStopTimes) bool {
+	if !s.allowed[t.Key.Date] {
+		return false
+	}
+	return canBoard(s.signals, t.Key, s.params.SeatClass, s.params.Passengers)
+}
+
+// improves reports whether arriving at station at time arr is worth recording,
+// applying both local dominance and target pruning.
+func (s *searchState) improves(arr int64, station string) bool {
+	// Target pruning: a label that lands after we can already be standing at
+	// the destination cannot lead to a better journey.
+	if bd, ok := s.best[s.dest]; ok && arr >= bd {
+		return false
+	}
+	b, ok := s.best[station]
+	return !ok || arr < b
+}
+
+// relaxFootpaths walks from each source station into its (transitively closed)
+// walk neighbourhood, recording walk legs in round k.
+func (s *searchState) relaxFootpaths(k int, sources []string, improved map[string]struct{}) {
+	curTau := s.tau[k]
+	curJournal := s.journal[k]
+	for _, from := range sources {
+		depart, ok := curTau[from]
 		if !ok {
 			continue
 		}
-
-		var legs []model.Leg
-		current := params.Destination
-		currRound := r
-
-		// Backtrack from destination to origin.
-		visited := make(map[string]bool)
-		for currRound > 0 && current != params.Origin {
-			if visited[current] {
-				break // cycle detected — discard
+		for _, fp := range s.routes.Footpaths[from] {
+			arr := depart + int64(fp.WalkSeconds)
+			if !s.improves(arr, fp.NeighbourStop) {
+				continue
 			}
-			visited[current] = true
-			e, exists := journal[currRound][current]
-			if !exists {
-				// Station not found in current round — find the earliest round
-				// where we actually arrived here (waited across round boundary).
-				for pr := currRound - 1; pr > 0; pr-- {
-					if pe, pExists := journal[pr][current]; pExists {
-						e = pe
-						currRound = pr
-						exists = true
-						break
-					}
-				}
-				if !exists {
-					break
-				}
+			curTau[fp.NeighbourStop] = arr
+			s.best[fp.NeighbourStop] = arr
+			curJournal[fp.NeighbourStop] = journalEntry{
+				kind:      model.LegWalk,
+				fromRound: k, // a walk happens inside the round that reached `from`
+				from:      from,
+				routeID:   model.WalkRouteID,
+				departure: depart,
+				arrival:   arr,
 			}
-
-			leg := model.Leg{
-				TripID:        e.tripKey.TripID,
-				Date:          e.tripKey.Date,
-				RouteID:       e.routeID,
-				BoardStation:  e.boardStop,
-				AlightStation: current,
-				DepartureUnix: e.boardDepUnix,
-				ArrivalUnix:   e.arrivalUnix,
-			}
-
-			// L8 fix: leg-continuity guard.
-			// When building backwards, legs[0] is the leg that immediately FOLLOWS
-			// the current leg in forward direction. Its BoardStation must equal the
-			// current leg's AlightStation.
-			if len(legs) > 0 && legs[0].BoardStation != leg.AlightStation {
-				legs = nil // gap — discard this path
-				break
-			}
-
-			legs = append([]model.Leg{leg}, legs...)
-			current = e.boardStop
-
-			// D5 fix: if boardStop has a journal entry in the SAME round, we took
-			// multiple legs in one round (transit+walk). Do NOT decrement currRound.
-			if _, foundHere := journal[currRound][e.boardStop]; !foundHere {
-				currRound--
-			}
-		}
-
-		if len(legs) > 0 && current == params.Origin {
-			paths = append(paths, model.Path{
-				Legs:        legs,
-				TotalTime:   entry.arrivalUnix - params.DepTime,
-				Transfers:   len(legs) - 1,
-				ArrivalUnix: entry.arrivalUnix,
-			})
+			improved[fp.NeighbourStop] = struct{}{}
 		}
 	}
-
-	return paths
 }
 
-// deduplicatePaths removes paths that represent the exact same physical journey.
-// L9 fix: RAPTOR can find the same journey in multiple rounds (e.g. round 1 for
-// a direct train AND round 2 for the same direct train + a skipped transfer).
-// We fingerprint by the sequence of TripID+BoardStation+AlightStation.
-// Uses a fresh allocation (not paths[:0]) to avoid sharing the underlying array
-// with the caller's slice, which can cause subtle overwrites if paths is reused.
+// extract turns the round labels into the Pareto frontier of journeys.
+//
+// tau[k][dest] is non-increasing in k by construction, so a round only earns a
+// place in the answer when it arrives strictly earlier than every round before
+// it. That set is exactly the Pareto frontier over (arrival, transfers).
+func (s *searchState) extract(topK int) []model.Path {
+	var out []model.Path
+	bestSoFar := infinity
+
+	for k := 0; k <= s.rounds; k++ {
+		if s.tau[k] == nil {
+			continue
+		}
+		arr, ok := s.tau[k][s.dest]
+		if !ok || arr >= bestSoFar {
+			continue
+		}
+		p, ok := s.buildPath(k)
+		if !ok {
+			// A label without a reconstructable, self-consistent chain is a bug
+			// signal, not something to hand to a passenger.
+			slog.Warn("discarding unreconstructable label",
+				"round", k, "origin", s.params.Origin, "destination", s.dest)
+			continue
+		}
+		bestSoFar = arr
+		out = append(out, p)
+	}
+
+	out = deduplicatePaths(out)
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].ArrivalUnix != out[j].ArrivalUnix {
+			return out[i].ArrivalUnix < out[j].ArrivalUnix
+		}
+		return out[i].Transfers < out[j].Transfers
+	})
+	out = paretoFilter(out)
+
+	if topK > 0 && len(out) > topK {
+		out = out[:topK]
+	}
+	return out
+}
+
+// buildPath backtracks from the destination label in the given round to the
+// origin, producing an ordered, validated journey.
+func (s *searchState) buildPath(round int) (model.Path, bool) {
+	var legs []model.Leg
+
+	cur := s.dest
+	r := round
+	visited := make(map[[2]int]bool)
+	maxSteps := 2*(s.rounds+1) + 2
+
+	for cur != s.params.Origin {
+		if len(legs) > maxSteps || r < 0 || r >= len(s.journal) {
+			return model.Path{}, false
+		}
+		e, ok := s.journal[r][cur]
+		if !ok || e.from == "" || e.from == cur {
+			return model.Path{}, false
+		}
+		// A (round, station) pair may only be consumed once; revisiting one
+		// means the journal contains a cycle.
+		mark := [2]int{r, len(legs)}
+		if visited[mark] {
+			return model.Path{}, false
+		}
+		visited[mark] = true
+
+		leg := model.Leg{
+			Kind:          e.kind,
+			RouteID:       e.routeID,
+			BoardStation:  e.from,
+			AlightStation: cur,
+			DepartureUnix: e.departure,
+			ArrivalUnix:   e.arrival,
+		}
+		if e.kind == model.LegTransit {
+			leg.TripID = e.tripKey.TripID
+			leg.Date = e.tripKey.Date
+		}
+		legs = append(legs, leg)
+
+		cur = e.from
+		r = e.fromRound
+	}
+
+	if len(legs) == 0 {
+		return model.Path{}, false
+	}
+	for i, j := 0, len(legs)-1; i < j; i, j = i+1, j-1 {
+		legs[i], legs[j] = legs[j], legs[i]
+	}
+
+	p := model.Path{
+		Legs:          legs,
+		Rounds:        round,
+		DepartureUnix: legs[0].DepartureUnix,
+		ArrivalUnix:   legs[len(legs)-1].ArrivalUnix,
+	}
+	p.TotalTimeSeconds = p.ArrivalUnix - p.DepartureUnix
+	p.WaitSeconds = p.DepartureUnix - s.params.DepTime
+
+	transit := 0
+	for _, l := range legs {
+		if l.Kind == model.LegTransit {
+			transit++
+		} else {
+			p.WalkSeconds += l.ArrivalUnix - l.DepartureUnix
+		}
+	}
+	if transit > 0 {
+		p.Transfers = transit - 1
+	}
+	if transit > s.rounds {
+		// Should be unreachable: round k boards only off tau[k-1]. Kept as a
+		// live assertion because the failure it guards is invisible otherwise.
+		slog.Error("round bound violated", "round", round, "transit_legs", transit, "max_rounds", s.rounds)
+		return model.Path{}, false
+	}
+
+	if err := ValidatePath(p, s.params); err != nil {
+		slog.Warn("discarding malformed path", "error", err, "round", round)
+		return model.Path{}, false
+	}
+	return p, true
+}
+
+// paretoFilter keeps only non-dominated journeys. Input must already be sorted
+// by arrival ascending; the sweep then keeps a journey only when it uses fewer
+// transfers than everything kept before it.
+func paretoFilter(paths []model.Path) []model.Path {
+	out := paths[:0:0]
+	bestTransfers := math.MaxInt32
+	for _, p := range paths {
+		if p.Transfers < bestTransfers {
+			out = append(out, p)
+			bestTransfers = p.Transfers
+		}
+	}
+	return out
+}
+
+// deduplicatePaths removes journeys that are the same physical sequence of
+// legs. Uses a fresh allocation so the result never shares backing storage
+// with the caller's slice.
 func deduplicatePaths(paths []model.Path) []model.Path {
 	seen := make(map[string]bool, len(paths))
-	out := make([]model.Path, 0, len(paths)) // fresh allocation — safe for callers
+	out := make([]model.Path, 0, len(paths))
 	for _, p := range paths {
 		fp := pathFingerprint(p)
 		if seen[fp] {
@@ -428,28 +556,41 @@ func deduplicatePaths(paths []model.Path) []model.Path {
 	return out
 }
 
+// pathFingerprint identifies a journey by its physical legs.
 func pathFingerprint(p model.Path) string {
-	b := make([]byte, 0, len(p.Legs)*40)
+	b := make([]byte, 0, len(p.Legs)*48)
 	for _, leg := range p.Legs {
+		b = append(b, leg.RouteID...)
+		b = append(b, '|')
 		b = append(b, leg.TripID...)
 		b = append(b, '|')
 		b = append(b, leg.BoardStation...)
-		b = append(b, '|')
+		b = append(b, '>')
 		b = append(b, leg.AlightStation...)
 		b = append(b, ';')
 	}
 	return string(b)
 }
 
-// overnightDate returns the YYYY-MM-DD string for the calendar day after `date`.
-// Used by findEarliestTrip to accept trips that were seeded for the next day
-// as part of an overnight journey crossing midnight.
-// If date is malformed, returns date unchanged (safe fallback — no match occurs).
-func overnightDate(date string) string {
-	t, err := time.Parse("2006-01-02", date)
+// computeAllowedDates returns the set of operating dates a search may use.
+//
+// The window runs from the day BEFORE the search date (an overnight service
+// that departed yesterday and is still running) through windowDays after it
+// (a multi-day journey whose later legs are seeded on later calendar days).
+// A malformed date yields the single-date fallback rather than an empty set,
+// so a bad input degrades to a same-day search instead of zero results.
+func computeAllowedDates(date string, windowDays int) map[string]bool {
+	allowed := make(map[string]bool, windowDays+2)
+	t, err := time.Parse(model.DateLayout, date)
 	if err != nil {
-		return date // malformed date: no overnight match will happen
+		allowed[date] = true
+		return allowed
 	}
-	return t.AddDate(0, 0, 1).Format("2006-01-02")
+	if windowDays < 0 {
+		windowDays = 0
+	}
+	for d := -1; d <= windowDays; d++ {
+		allowed[t.AddDate(0, 0, d).Format(model.DateLayout)] = true
+	}
+	return allowed
 }
-

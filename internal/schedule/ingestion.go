@@ -19,7 +19,7 @@ type IngestTrip struct {
 }
 
 // ValidateBatch validates the entire batch BEFORE opening a Postgres transaction.
-// On any error, the whole payload is rejected — no partial inserts (G2).
+// On any error the whole payload is rejected — no partial inserts.
 func ValidateBatch(trips []IngestTrip) error {
 	seen := make(map[model.TripKey]bool, len(trips))
 	for _, t := range trips {
@@ -34,9 +34,8 @@ func ValidateBatch(trips []IngestTrip) error {
 		}
 
 		for i, st := range t.StopTimes {
-			// L2 fix: validate that ArrivalUnix is set and non-negative.
-			// Guard is < 0 (not <= 0): Unix epoch (0) is technically valid,
-			// though no real train departs at 1970-01-01 00:00 UTC.
+			// Guard is < 0, not <= 0: the Unix epoch is a technically valid
+			// timestamp, even if no real service departs at 1970-01-01 00:00 UTC.
 			if st.ArrivalUnix < 0 {
 				return fmt.Errorf("trip %v stop %d: negative arrival_unix %d", key, i, st.ArrivalUnix)
 			}
@@ -60,7 +59,8 @@ func ValidateBatch(trips []IngestTrip) error {
 // IngestBatch validates and inserts a batch of trips into Postgres within
 // a single transaction. If anything fails, the entire batch is rolled back.
 func IngestBatch(ctx context.Context, pool *pgxpool.Pool, trips []IngestTrip) error {
-	// G2: Validate BEFORE opening a transaction
+	// Validate BEFORE opening a transaction: a partially applied batch leaves
+	// the timetable in a state no reader can make sense of.
 	if err := ValidateBatch(trips); err != nil {
 		return fmt.Errorf("validation failed: %w", err)
 	}
@@ -95,7 +95,6 @@ func IngestBatch(ctx context.Context, pool *pgxpool.Pool, trips []IngestTrip) er
 		}
 
 		for _, st := range t.StopTimes {
-			// L2 fix: insert both arrival_unix and departure_unix.
 			_, err := tx.Exec(ctx,
 				`INSERT INTO stop_times
 				   (trip_id, date, stop_seq, station_id, arrival_unix, departure_unix)
