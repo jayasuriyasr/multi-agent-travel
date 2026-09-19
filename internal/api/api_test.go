@@ -53,6 +53,10 @@ func testApp(t *testing.T) *fiber.App {
 	buf.StopToRoutes["A"] = []schedule.RouteStop{{RouteIdx: 0, StopPos: 0}}
 	buf.StopToRoutes["B"] = []schedule.RouteStop{{RouteIdx: 0, StopPos: 1}}
 	schedule.SwapRoutes(buf)
+	// HasSeatData is a one-way latch by design, so every test that builds an app
+	// must start from a known state. Without this, tests only pass on a fresh
+	// process and `go test -count=2` fails on whichever one happens to run second.
+	state.ResetSeatDataLatch()
 	state.SwapSignal(make(state.SignalBuffer))
 	state.MarkReady()
 
@@ -320,7 +324,7 @@ func signals(pairs map[string]bool) state.SignalBuffer {
 // down" and "the data has gone stale" all look identical from the outside —
 // results that vanish — so the difference has to be said out loud.
 func TestReady_ReportsTheSpecificDegradation(t *testing.T) {
-	testApp(t) // publishes the schedule and marks ready
+	testApp(t) // publishes the schedule, clears the latch and marks ready
 	t.Cleanup(func() { state.SwapSignal(make(state.SignalBuffer)) })
 
 	srv := newServerWithHealthyValidator(t, 3, time.Hour)

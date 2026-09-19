@@ -64,6 +64,22 @@ func SwapSignal(staging SignalBuffer) {
 	}
 }
 
+// ResetSeatDataLatch clears the "seat data has ever been loaded" latch.
+//
+// The latch is deliberately one-way in production: once a buffer has arrived,
+// a later empty one means the feed broke, not that the service never had data.
+// Tests that assert on the never-loaded state need a way back, and without one
+// they only pass on a fresh process — which is why `go test -count=2` used to
+// fail here. Mirrors schedule.ResetManifest.
+func ResetSeatDataLatch() {
+	seatDataPresent.Store(false)
+	empty := make(SignalBuffer)
+	liveSignal.Store(&empty)
+	signalCount.Store(0)
+	staleCount.Store(0)
+	lastSwapUnix.Store(0)
+}
+
 // SignalCount returns the number of trips currently carrying a seat signal.
 func SignalCount() int { return int(signalCount.Load()) }
 

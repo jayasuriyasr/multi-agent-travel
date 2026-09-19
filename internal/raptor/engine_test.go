@@ -92,14 +92,12 @@ func TestEarliestTrip_PicksEarliestCatchable(t *testing.T) {
 	s := newTestState(t, model.SearchParams{Date: testDate, SeatClass: "lower", Passengers: 1}, nil)
 
 	// Ready at 10:00: T1 (09:00) has gone, T2 (11:00) is the earliest catchable.
-	for _, fifo := range []bool{true, false} {
-		idx := s.earliestTrip(trips, 0, at(10, 0), infinity, fifo)
-		if idx < 0 {
-			t.Fatalf("fifo=%v: expected T2, got no trip", fifo)
-		}
-		if got := trips[idx].Key.TripID; got != "T2" {
-			t.Errorf("fifo=%v: got %s, want T2", fifo, got)
-		}
+	idx := s.earliestTrip(trips, 0, at(10, 0), infinity)
+	if idx < 0 {
+		t.Fatal("expected T2, got no trip")
+	}
+	if got := trips[idx].Key.TripID; got != "T2" {
+		t.Errorf("got %s, want T2", got)
 	}
 }
 
@@ -110,7 +108,7 @@ func TestEarliestTrip_RejectsDatesOutsideWindow(t *testing.T) {
 		// 10 days out: far beyond the calendar window.
 		simpleTST("T_FAR", dayString(10), []string{"A", "B"}, []int64{atDay(10, 9, 0), atDay(10, 10, 0)}),
 	}
-	if idx := s.earliestTrip(trips, 0, at(8, 0), infinity, true); idx >= 0 {
+	if idx := s.earliestTrip(trips, 0, at(8, 0), infinity); idx >= 0 {
 		t.Fatalf("trip on %s should be outside the date window, got index %d", dayString(10), idx)
 	}
 }
@@ -122,7 +120,7 @@ func TestEarliestTrip_AcceptsNextDayAndPreviousDay(t *testing.T) {
 	next := []model.TripStopTimes{
 		simpleTST("T_NEXT", dayString(1), []string{"A", "B"}, []int64{atDay(1, 6, 0), atDay(1, 7, 0)}),
 	}
-	if idx := s.earliestTrip(next, 0, at(23, 0), infinity, true); idx < 0 {
+	if idx := s.earliestTrip(next, 0, at(23, 0), infinity); idx < 0 {
 		t.Error("next-day trip should be inside the date window")
 	}
 
@@ -130,7 +128,7 @@ func TestEarliestTrip_AcceptsNextDayAndPreviousDay(t *testing.T) {
 	prev := []model.TripStopTimes{
 		simpleTST("T_PREV", dayString(-1), []string{"A", "B"}, []int64{atDay(-1, 23, 0), at(3, 0)}),
 	}
-	if idx := s.earliestTrip(prev, 0, atDay(-1, 22, 0), infinity, true); idx < 0 {
+	if idx := s.earliestTrip(prev, 0, atDay(-1, 22, 0), infinity); idx < 0 {
 		t.Error("previous-day overnight trip should be inside the date window")
 	}
 }
@@ -145,35 +143,62 @@ func TestEarliestTrip_SkipsFullTrains(t *testing.T) {
 	}
 	s := newTestState(t, model.SearchParams{Date: testDate, SeatClass: "lower", Passengers: 1}, signals)
 
-	for _, fifo := range []bool{true, false} {
-		idx := s.earliestTrip(trips, 0, at(8, 0), infinity, fifo)
-		if idx < 0 {
-			t.Fatalf("fifo=%v: expected T_OPEN, got no trip", fifo)
-		}
-		if got := trips[idx].Key.TripID; got != "T_OPEN" {
-			t.Errorf("fifo=%v: got %s, want T_OPEN (T_FULL has no seats)", fifo, got)
-		}
+	idx := s.earliestTrip(trips, 0, at(8, 0), infinity)
+	if idx < 0 {
+		t.Fatal("expected T_OPEN, got no trip")
+	}
+	if got := trips[idx].Key.TripID; got != "T_OPEN" {
+		t.Errorf("got %s, want T_OPEN (T_FULL has no seats)", got)
 	}
 }
 
-// Regression: on a route where an express overtakes a local, binary search
-// walks past the genuinely earliest-arriving trip. The loader marks such routes
-// non-FIFO precisely so the linear scan handles them.
-func TestEarliestTrip_NonFIFORouteFindsOvertakingExpress(t *testing.T) {
-	// Sorted by departure at stop 0. The express leaves later but reaches
-	// stop 1 first, so at stop 1 it departs *before* the local.
+// Regression: on a route where an express overtakes a local, a single forward
+// pass boards the earliest DEPARTING trip and rides it past the express. Such
+// routes are scanned once per trip instead, so the express is still found.
+func TestNonFIFORoute_FindsOvertakingExpress(t *testing.T) {
+	// Sorted by departure at stop 0. The express leaves A later but reaches B
+	// and C first, so at B it departs *before* the local.
 	trips := []model.TripStopTimes{
 		simpleTST("T_LOCAL", testDate, []string{"A", "B", "C"}, []int64{at(8, 0), at(11, 0), at(14, 0)}),
 		simpleTST("T_EXPRESS", testDate, []string{"A", "B", "C"}, []int64{at(9, 0), at(10, 0), at(11, 0)}),
 	}
-	s := newTestState(t, model.SearchParams{Date: testDate, SeatClass: "lower", Passengers: 1}, nil)
+	newGraph().addRoute("R", []string{"A", "B", "C"}, trips, false).publish(nil)
 
-	idx := s.earliestTrip(trips, 1, at(9, 30), infinity, false)
-	if idx < 0 {
-		t.Fatal("linear scan should find the express at stop B")
+	paths := search(t, "A", "C", at(7, 0), nil)
+	if len(paths) == 0 {
+		t.Fatal("expected a journey from A to C")
 	}
-	if got := trips[idx].Key.TripID; got != "T_EXPRESS" {
-		t.Errorf("got %s, want T_EXPRESS", got)
+	if got, want := legSummary(paths[0]), "T_EXPRESS:A>C"; got != want {
+		t.Errorf("got %s (arriving %d), want %s — the local departs first but arrives three hours later",
+			got, paths[0].ArrivalUnix, want)
+	}
+	if got, want := paths[0].ArrivalUnix, at(11, 0); got != want {
+		t.Errorf("arrival %d, want %d", got, want)
+	}
+}
+
+// The per-trip scan must still respect the transfer buffer and the previous
+// round's label, exactly as the route-wide scan does.
+func TestNonFIFORoute_HonoursTransferBufferOnBoarding(t *testing.T) {
+	feeder := []model.TripStopTimes{
+		simpleTST("FEED", testDate, []string{"Z", "B"}, []int64{at(8, 0), at(9, 55)}),
+	}
+	over := []model.TripStopTimes{
+		simpleTST("T_LOCAL", testDate, []string{"A", "B", "C"}, []int64{at(8, 0), at(11, 0), at(14, 0)}),
+		simpleTST("T_EXPRESS", testDate, []string{"A", "B", "C"}, []int64{at(9, 0), at(10, 0), at(11, 0)}),
+	}
+	g := newGraph().addRoute("R", []string{"A", "B", "C"}, over, false)
+	g.addRoute("F", []string{"Z", "B"}, feeder, true)
+	g.publish(nil)
+
+	// Arriving at B at 09:55 with a 600s buffer means ready at 10:05 — too late
+	// for the express at 10:00, so only the local at 11:00 is catchable.
+	paths := search(t, "Z", "C", at(7, 0), func(p *model.SearchParams) { p.MinTransferSeconds = 600 })
+	if len(paths) == 0 {
+		t.Fatal("expected a journey from Z to C")
+	}
+	if got, want := legSummary(paths[0]), "FEED:Z>B|T_LOCAL:B>C"; got != want {
+		t.Errorf("got %s, want %s — the express should be out of reach with a 10-minute buffer", got, want)
 	}
 }
 

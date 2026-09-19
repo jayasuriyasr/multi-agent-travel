@@ -99,6 +99,15 @@ type searchState struct {
 	// best[stop] is the earliest arrival over all rounds (tau* in the paper),
 	// used for dominance checks and target pruning.
 	best map[string]int64
+
+	// preWalk[k][stop] is journal[k][stop] as it stood just before round k's
+	// footpath pass — always the transit leg that made the stop a walk source.
+	//
+	// A walk relaxes from the label the stop had at that moment. If a walk from
+	// somewhere else then lowers the same stop, journal[k] holds the walk and
+	// backtracking would render two walks in a row for a journey that only ever
+	// took one. This keeps the entry the walk actually left from.
+	preWalk []map[string]journalEntry
 }
 
 // RaptorSearch performs a seat-aware RAPTOR traversal and returns up to topK
@@ -140,6 +149,7 @@ func RaptorSearch(ctx context.Context, params model.SearchParams, topK int) []mo
 	}
 	s.tau = make([]map[string]int64, s.rounds+1)
 	s.journal = make([]map[string]journalEntry, s.rounds+1)
+	s.preWalk = make([]map[string]journalEntry, s.rounds+1)
 	s.tau[0] = map[string]int64{params.Origin: params.DepTime}
 	s.journal[0] = map[string]journalEntry{}
 
@@ -174,6 +184,13 @@ func RaptorSearch(ctx context.Context, params model.SearchParams, topK int) []mo
 		queue := make(map[int]int)
 		for stop := range marked {
 			for _, rs := range routes.StopToRoutes[stop] {
+				// The index comes from the published buffer, which a partial or
+				// interrupted ingest can leave inconsistent. A negative position
+				// would win the minimum below and then index a slice backwards,
+				// so reject nonsense here rather than carry it into the scan.
+				if rs.RouteIdx < 0 || rs.RouteIdx >= len(routes.Routes) || rs.StopPos < 0 {
+					continue
+				}
 				if pos, seen := queue[rs.RouteIdx]; !seen || rs.StopPos < pos {
 					queue[rs.RouteIdx] = rs.StopPos
 				}
@@ -222,7 +239,7 @@ func RaptorSearch(ctx context.Context, params model.SearchParams, topK int) []mo
 // boardPos, alighting wherever the current trip improves a station, and
 // boarding an earlier trip wherever round k-1 got the passenger there in time.
 func (s *searchState) scanRoute(k, routeIdx, boardPos int, improved map[string]struct{}) {
-	if routeIdx >= len(s.routes.StopTimes) || routeIdx >= len(s.routes.Routes) {
+	if routeIdx < 0 || routeIdx >= len(s.routes.StopTimes) || routeIdx >= len(s.routes.Routes) {
 		return
 	}
 	route := s.routes.Routes[routeIdx]
@@ -230,7 +247,29 @@ func (s *searchState) scanRoute(k, routeIdx, boardPos int, improved map[string]s
 	if len(trips) == 0 || len(route.StopIDs) == 0 {
 		return
 	}
-	fifo := s.routes.IsFIFO(routeIdx)
+	if boardPos < 0 {
+		boardPos = 0 // defence in depth; the queue already rejects these
+	}
+	if !s.routes.IsFIFO(routeIdx) {
+		// OVERTAKING ROUTE — one forward pass cannot be optimal here.
+		//
+		// The classic scan below carries a single "currently riding" trip and
+		// only ever switches to an EARLIER-DEPARTING one. That is optimal
+		// exactly when no trip overtakes another, which is what FIFO means. On
+		// a route where an express passes a local, the earliest departure can
+		// arrive last, and one pass will ride the local straight past it.
+		//
+		// Scanning each trip independently and keeping the best arrival fixes
+		// that. It is equivalent to the classic scan on a FIFO route, and it is
+		// exact here because boarding always reads tau[k-1] and never the ride
+		// in progress — so switching trips mid-route is the same thing as
+		// boarding that trip directly. Cost is O(trips × stops), paid only on
+		// routes the loader actually measured as overtaking.
+		for ti := range trips {
+			s.scanTrip(k, route, &trips[ti], boardPos, improved)
+		}
+		return
+	}
 
 	prevTau := s.tau[k-1]
 	prevJournal := s.journal[k-1]
@@ -286,10 +325,73 @@ func (s *searchState) scanRoute(k, routeIdx, boardPos int, improved map[string]s
 			continue // cannot beat the trip already being ridden
 		}
 
-		if cand := s.earliestTrip(trips, pos, ready, curDep, fifo); cand >= 0 {
+		if cand := s.earliestTrip(trips, pos, ready, curDep); cand >= 0 {
 			tripIdx = cand
 			boardStation = station
 			boardDep = trips[cand].Departures[pos]
+		}
+	}
+}
+
+// scanTrip rides one specific trip forward from boardPos: board at the first
+// stop round k-1 gets the passenger to in time, then propagate that trip's
+// arrivals to every stop after it.
+//
+// Used only for overtaking routes, where the route-wide scan is not valid.
+// Boarding as early as the trip allows dominates boarding later on the same
+// trip — the arrival times are fixed, and an earlier boarding point reaches a
+// superset of the stops — so one boarding decision per trip is enough.
+func (s *searchState) scanTrip(k int, route model.RouteEntry, t *model.TripStopTimes, boardPos int, improved map[string]struct{}) {
+	if !s.tripUsable(t) {
+		return
+	}
+
+	prevTau := s.tau[k-1]
+	prevJournal := s.journal[k-1]
+	curTau := s.tau[k]
+	curJournal := s.journal[k]
+
+	boarded := false
+	boardStation := ""
+	boardDep := int64(0)
+
+	for pos := boardPos; pos < len(route.StopIDs); pos++ {
+		station := route.StopIDs[pos]
+
+		// ── Step A: alight ────────────────────────────────────────────────
+		if boarded && pos < len(t.Arrivals) {
+			arr := t.Arrivals[pos]
+			if s.improves(arr, station) {
+				curTau[station] = arr
+				s.best[station] = arr
+				curJournal[station] = journalEntry{
+					kind:      model.LegTransit,
+					fromRound: k - 1,
+					from:      boardStation,
+					tripKey:   t.Key,
+					routeID:   route.RouteID,
+					departure: boardDep,
+					arrival:   arr,
+				}
+				improved[station] = struct{}{}
+			}
+		}
+
+		// ── Step B: board ─────────────────────────────────────────────────
+		if boarded || pos >= len(t.Departures) {
+			continue
+		}
+		ready, reachable := prevTau[station]
+		if !reachable {
+			continue
+		}
+		if e, had := prevJournal[station]; had && e.kind == model.LegTransit {
+			ready += s.xferSec
+		}
+		if t.Departures[pos] >= ready {
+			boarded = true
+			boardStation = station
+			boardDep = t.Departures[pos]
 		}
 	}
 }
@@ -298,51 +400,32 @@ func (s *searchState) scanRoute(k, routeIdx, boardPos int, improved map[string]s
 // pos at or after ready, strictly before mustBeat, that passes the date and
 // seat filters. It returns -1 when no such trip exists.
 //
-// Two strategies, chosen by a property measured at load time rather than
-// assumed:
-//
-//   - FIFO routes (no trip overtakes another at any stop) allow a binary
-//     search followed by a short forward scan.
-//   - Non-FIFO routes — an express passing a local on shared track — get a full
-//     linear scan. Binary search is simply wrong there, and silently returns a
-//     suboptimal trip rather than failing loudly.
-func (s *searchState) earliestTrip(trips []model.TripStopTimes, pos int, ready, mustBeat int64, fifo bool) int {
-	if fifo {
-		// Safe because RouteFIFO is only true when every trip on the route has
-		// the same stop count, which makes this predicate monotone.
-		lo := sort.Search(len(trips), func(i int) bool {
-			d := trips[i].Departures
-			if pos >= len(d) {
-				return true
-			}
-			return d[pos] >= ready
-		})
-		for i := lo; i < len(trips); i++ {
-			d := trips[i].Departures
-			if pos >= len(d) {
-				continue
-			}
-			if d[pos] >= mustBeat {
-				break // FIFO: no later trip departs earlier
-			}
-			if s.tripUsable(&trips[i]) {
-				return i
-			}
-		}
-		return -1
-	}
-
-	bestIdx, bestDep := -1, mustBeat
-	for i := range trips {
+// Binary search plus a short forward scan. This is only ever called for routes
+// the loader measured as FIFO, which computeFIFO now guarantees also means
+// every trip serves the same number of stops — so the predicate below is
+// monotone and the early break is sound. Overtaking routes never reach here;
+// scanRoute sends them to scanTrip instead.
+func (s *searchState) earliestTrip(trips []model.TripStopTimes, pos int, ready, mustBeat int64) int {
+	lo := sort.Search(len(trips), func(i int) bool {
 		d := trips[i].Departures
-		if pos >= len(d) || d[pos] < ready || d[pos] >= bestDep {
+		if pos >= len(d) {
+			return true
+		}
+		return d[pos] >= ready
+	})
+	for i := lo; i < len(trips); i++ {
+		d := trips[i].Departures
+		if pos >= len(d) {
 			continue
 		}
+		if d[pos] >= mustBeat {
+			break // FIFO: no later trip departs earlier
+		}
 		if s.tripUsable(&trips[i]) {
-			bestIdx, bestDep = i, d[pos]
+			return i
 		}
 	}
-	return bestIdx
+	return -1
 }
 
 // tripUsable applies the calendar-date window and the optimistic seat pre-filter.
@@ -370,11 +453,41 @@ func (s *searchState) improves(arr int64, station string) bool {
 func (s *searchState) relaxFootpaths(k int, sources []string, improved map[string]struct{}) {
 	curTau := s.tau[k]
 	curJournal := s.journal[k]
+
+	// Snapshot each source's departure time BEFORE any walk is written.
+	//
+	// Snapshotting only the source LIST is not enough. A station can be both a
+	// source (transit improved it this round) and the target of a walk from an
+	// earlier source in the same pass. Reading the live label there lets it set
+	// off from a time this pass just wrote, chaining two walk legs into one
+	// round and rebuilding footpath edges the loader's closure deliberately
+	// dropped for exceeding MaxWalkSeconds. Worse, sources is sorted by station
+	// ID, so whether that happens depends on how the IDs collate — the same
+	// network answers differently under a rename.
+	type walkSource struct {
+		from   string
+		depart int64
+	}
+	var srcs []walkSource
 	for _, from := range sources {
+		if len(s.routes.Footpaths[from]) == 0 {
+			continue // nothing to walk to; nothing worth remembering
+		}
 		depart, ok := curTau[from]
 		if !ok {
 			continue
 		}
+		srcs = append(srcs, walkSource{from: from, depart: depart})
+		if e, had := curJournal[from]; had {
+			if s.preWalk[k] == nil {
+				s.preWalk[k] = make(map[string]journalEntry, len(sources))
+			}
+			s.preWalk[k][from] = e
+		}
+	}
+
+	for _, src := range srcs {
+		from, depart := src.from, src.depart
 		for _, fp := range s.routes.Footpaths[from] {
 			arr := depart + int64(fp.WalkSeconds)
 			if !s.improves(arr, fp.NeighbourStop) {
@@ -446,8 +559,18 @@ func (s *searchState) buildPath(round int) (model.Path, bool) {
 
 	cur := s.dest
 	r := round
-	visited := make(map[[2]int]bool)
+	// Keyed on (round, station): that is the pair the journal can repeat. An
+	// earlier version keyed on (round, len(legs)), and because len(legs) grows
+	// on every iteration the key was never repeated and the guard never fired.
+	type visitKey struct {
+		round   int
+		station string
+	}
+	visited := make(map[visitKey]bool)
 	maxSteps := 2*(s.rounds+1) + 2
+
+	prevKind := model.LegKind("")
+	prevDeparture := int64(0)
 
 	for cur != s.params.Origin {
 		if len(legs) > maxSteps || r < 0 || r >= len(s.journal) {
@@ -457,9 +580,18 @@ func (s *searchState) buildPath(round int) (model.Path, bool) {
 		if !ok || e.from == "" || e.from == cur {
 			return model.Path{}, false
 		}
+		// Two walks in a row cannot be right: the footpath graph is closed, so a
+		// second hop is either redundant or past the walking cap the loader
+		// enforced. It only appears when a later walk overwrote the label this
+		// leg departed from — so use the entry that was there at the time.
+		if prevKind == model.LegWalk && e.kind == model.LegWalk {
+			if pre, had := s.preWalk[r][cur]; had && pre.from != "" && pre.arrival <= prevDeparture {
+				e = pre
+			}
+		}
 		// A (round, station) pair may only be consumed once; revisiting one
 		// means the journal contains a cycle.
-		mark := [2]int{r, len(legs)}
+		mark := visitKey{round: r, station: cur}
 		if visited[mark] {
 			return model.Path{}, false
 		}
@@ -479,6 +611,7 @@ func (s *searchState) buildPath(round int) (model.Path, bool) {
 		}
 		legs = append(legs, leg)
 
+		prevKind, prevDeparture = e.kind, e.departure
 		cur = e.from
 		r = e.fromRound
 	}

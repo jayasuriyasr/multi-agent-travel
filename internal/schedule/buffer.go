@@ -234,14 +234,41 @@ func (b *RouteBuffer) TripDeparture(key model.TripKey) int64 {
 // computeFIFO reports whether trips (already sorted by first departure) are
 // non-overtaking at every stop position.
 func computeFIFO(trips []model.TripStopTimes) bool {
-	for i := 1; i < len(trips); i++ {
-		prev, curr := trips[i-1].Departures, trips[i].Departures
-		n := len(curr)
-		if len(prev) < n {
-			n = len(prev)
+	if len(trips) < 2 {
+		return true
+	}
+
+	// Every trip must serve the same number of stops before the consecutive
+	// check below can be trusted.
+	//
+	// Checking only adjacent pairs is sound when each pair is compared over the
+	// same positions, because the ordering is then transitive. Truncating each
+	// comparison to the shorter trip breaks that: two long trips separated by a
+	// short one are never compared past the short one's length, so an overtake
+	// hiding there marks the route FIFO and sends earliestTrip into a binary
+	// search that is not valid on it — silently returning a later trip.
+	n := len(trips[0].Departures)
+	for i := range trips {
+		if len(trips[i].Departures) != n || len(trips[i].Arrivals) != n {
+			return false
 		}
+	}
+
+	// Both arrivals and departures must be ordered.
+	//
+	// Departures alone are not enough. Dwell times differ, so one trip can pull
+	// in earlier and still leave later: A arrives 10:02 and departs 10:03, B
+	// arrives 10:00 and departs 10:10. Departures are in order, arrivals are
+	// not — and a scan that boards the earliest departure upstream rides A and
+	// reports 10:02 at a stop where B was standing at 10:00. Checking arrivals
+	// too is what makes "board the earliest departure" safe.
+	for i := 1; i < len(trips); i++ {
+		prev, curr := &trips[i-1], &trips[i]
 		for pos := 0; pos < n; pos++ {
-			if curr[pos] < prev[pos] {
+			if curr.Departures[pos] < prev.Departures[pos] {
+				return false
+			}
+			if curr.Arrivals[pos] < prev.Arrivals[pos] {
 				return false
 			}
 		}

@@ -98,6 +98,11 @@ func TestComputeFIFO(t *testing.T) {
 	tst := func(deps ...int64) model.TripStopTimes {
 		return model.TripStopTimes{Departures: deps, Arrivals: deps}
 	}
+	// A trip whose arrivals and departures differ, so dwell time can reorder
+	// the two independently.
+	dwelling := func(arrivals, departures []int64) model.TripStopTimes {
+		return model.TripStopTimes{Arrivals: arrivals, Departures: departures}
+	}
 
 	cases := []struct {
 		name  string
@@ -108,8 +113,30 @@ func TestComputeFIFO(t *testing.T) {
 		{"parallel trips are FIFO", []model.TripStopTimes{tst(100, 200), tst(300, 400)}, true},
 		{"equal times at a stop are FIFO", []model.TripStopTimes{tst(100, 200), tst(300, 200)}, true},
 		{"an express overtaking a local is not FIFO", []model.TripStopTimes{tst(100, 500), tst(200, 300)}, false},
-		{"mismatched stop counts compare only the overlap",
-			[]model.TripStopTimes{tst(100, 200), tst(300)}, true},
+		// Mixed stop counts are refused outright. The consecutive-pair check is
+		// only transitive when every pair is compared over the same positions;
+		// truncating to the overlap lets an overtake hide past a shorter trip's
+		// last stop and mark an overtaking route FIFO.
+		{"mismatched stop counts are not treated as FIFO",
+			[]model.TripStopTimes{tst(100, 200), tst(300)}, false},
+		// Departures alone are not enough: dwell times let one trip pull in
+		// first and still leave last.
+		{"ordered departures but overtaking arrivals are not FIFO",
+			[]model.TripStopTimes{
+				dwelling([]int64{100, 302}, []int64{100, 303}), // arrives second stop at 302
+				dwelling([]int64{200, 300}, []int64{200, 310}), // arrives at 300 — earlier
+			}, false},
+		{"ordered departures and ordered arrivals are FIFO",
+			[]model.TripStopTimes{
+				dwelling([]int64{100, 300}, []int64{100, 305}),
+				dwelling([]int64{200, 400}, []int64{200, 410}),
+			}, true},
+		{"a short trip between two long ones hides an overtake",
+			[]model.TripStopTimes{
+				tst(100, 200, 300, 900), // slow
+				tst(110, 210, 310),      // short — truncates both comparisons
+				tst(120, 220, 320, 400), // overtakes the slow trip at position 3
+			}, false},
 	}
 
 	for _, tc := range cases {
